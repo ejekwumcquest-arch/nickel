@@ -357,4 +357,4 @@ if __name__ == '__main__':
             process_new_members(diff_dict, token)
 
         current_ids = new_ids
-        time.sleep(10)
+        time.sleep(60)
