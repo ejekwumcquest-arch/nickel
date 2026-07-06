@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- Read configuration from environment variables (for Render) ----------
 if 'DISCORD_TOKEN' in os.environ:
-    # Running on Render – use environment variables
     token = os.environ.get('DISCORD_TOKEN')
     guildId = os.environ.get('DISCORD_GUILD_ID')
     channelId = os.environ.get('DISCORD_CHANNEL_ID')
@@ -12,7 +11,6 @@ if 'DISCORD_TOKEN' in os.environ:
     blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
     blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
 else:
-    # Running locally – use config.json
     from json import load
     config = load(open('config.json'))
     guildId, channelId, proxy, token, webhook, blacklistedRoles, blacklistedUsers = (
@@ -34,7 +32,7 @@ logging.basicConfig(
 )
 
 # ---------- Constants ----------
-JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60   # 2 days
+JOIN_WINDOW_SECONDS = 30 * 24 * 60 * 60   # 30 days (change this to whatever you want)
 
 class Utils:
     def rangeCorrector(ranges):
@@ -264,7 +262,6 @@ def send_webhook(member_id, join_time, tag):
         guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
         guild_name = guild_resp.json().get('name', 'Unknown')
 
-        # Extract clean username (remove @ and #0)
         if tag.startswith('@'):
             clean_username = tag[1:]
         elif '#' in tag:
@@ -313,14 +310,19 @@ def process_new_members(new_members_dict, token):
                 sess = session(token)
                 resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}/members/{member_id}')
                 if resp.status_code != 200:
+                    logging.warning("Member %s not found or API error (status %s)", member_id, resp.status_code)
                     return
                 join_date = resp.json().get('joined_at')
                 if not join_date:
                     return
                 join_time = datetime.datetime.fromisoformat(join_date)
                 now = datetime.datetime.now(datetime.timezone.utc)
-                if now - join_time <= datetime.timedelta(seconds=JOIN_WINDOW_SECONDS):
-                    logging.info("✅ New member (within 2 days): %s", member_id)
+                age = (now - join_time).total_seconds()
+                age_days = round(age / 86400, 1)
+                logging.info("Member %s (%s) joined %.1f days ago (window: %.0f days)", 
+                             member_id, tag, age_days, JOIN_WINDOW_SECONDS/86400)
+                if age <= JOIN_WINDOW_SECONDS:
+                    logging.info("✅ New member (within %.0f days): %s", JOIN_WINDOW_SECONDS/86400, member_id)
                     send_webhook(member_id, join_time, tag)
                 time.sleep(0.1)
             except Exception as e:
@@ -340,9 +342,8 @@ def process_new_members(new_members_dict, token):
 
 
 if __name__ == '__main__':
-    logging.info("Starting scraper (10s interval, 2-day join window)...")
+    logging.info("Starting scraper (10s interval, %.0f-day join window)...", JOIN_WINDOW_SECONDS/86400)
 
-    # Keep the service alive on Render by adding a simple HTTP server
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -363,7 +364,7 @@ if __name__ == '__main__':
     current_ids = set(current_members.keys())
     logging.info("Baseline built: %s members visible.", len(current_ids))
 
-    logging.info("Checking baseline members for recent joins (within 2 days)...")
+    logging.info("Checking baseline members for recent joins (within %.0f days)...", JOIN_WINDOW_SECONDS/86400)
     process_new_members(current_members, token)
 
     while True:
