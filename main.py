@@ -135,6 +135,7 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
+        logging.info("🔄 scrapeUsers called – sending op 14")
         payload = {
             "op": 14,
             "d": {
@@ -146,6 +147,7 @@ class DiscordSocket(websocket.WebSocketApp):
             }
         }
         self.send(json.dumps(payload))
+        logging.info(f"📤 Sent op 14 with ranges {self.ranges}")
 
     def sock_open(self, ws):
         identify = {
@@ -181,6 +183,7 @@ class DiscordSocket(websocket.WebSocketApp):
             }
         }
         self.send(json.dumps(identify))
+        logging.info("✅ Sent identify (op 2)")
 
     def heartbeatThread(self, interval):
         try:
@@ -199,6 +202,13 @@ class DiscordSocket(websocket.WebSocketApp):
             op = decoded.get("op")
             t = decoded.get("t")
 
+            # Log every event type
+            if t:
+                logging.info(f"📩 Received event: {t}")
+                if t == "GUILD_MEMBER_LIST_UPDATE":
+                    # Log a snippet of the raw message
+                    logging.info(f"📄 GUILD_MEMBER_LIST_UPDATE snippet: {message[:500]}")
+
             if op != 11:
                 self.packets_recv += 1
 
@@ -206,13 +216,24 @@ class DiscordSocket(websocket.WebSocketApp):
                 threading.Thread(target=self.heartbeatThread, args=(decoded["d"]["heartbeat_interval"] / 1000,), daemon=True).start()
 
             if t == "READY":
+                # Log raw READY (first 1000 chars) to see if we get guilds
+                logging.info(f"📄 RAW READY: {json.dumps(decoded, indent=2)[:1000]}")
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
+                # Log found guilds
+                logging.info(f"🏛️ Guilds in READY: {list(self.guilds.keys())}")
 
             if t == "READY_SUPPLEMENTAL":
+                logging.info("📌 READY_SUPPLEMENTAL received")
                 member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
+                logging.info(f"📊 Member count for guild {self.guild_id}: {member_count}")
                 if member_count:
                     self.ranges = Utils.getRanges(0, 100, member_count)
+                    self.scrapeUsers()
+                else:
+                    logging.warning("⚠️ Member count is 0 – cannot scrape.")
+                    # fallback: try default ranges
+                    self.ranges = Utils.getRanges(0, 100, 1000)
                     self.scrapeUsers()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
@@ -317,7 +338,6 @@ def session(token):
     return sess
 
 def send_webhook_with_retry(member_id, join_time, tag, max_retries=3):
-    """Send webhook with exponential backoff on 429."""
     attempt = 0
     while attempt <= max_retries:
         try:
@@ -351,7 +371,6 @@ def send_webhook_with_retry(member_id, join_time, tag, max_retries=3):
                 logging.info(f"✅ Webhook sent successfully for {member_id}")
                 return
             elif response.status_code == 429:
-                # Rate limited – wait and retry
                 retry_after = response.json().get('retry_after', 1)
                 wait_time = max(1, retry_after)
                 logging.warning(f"Webhook rate limited for {member_id}, waiting {wait_time}s...")
@@ -393,7 +412,6 @@ def process_new_members(new_members_dict):
                 send_webhook_with_retry(member_id, join_time, tag)
                 notified_members.add(member_id)
                 save_notified_cache()
-                # Delay between webhook requests to avoid rate limits
                 time.sleep(0.5)
             else:
                 logging.debug("Member %s joined %.1f days ago – skipped", member_id, age/86400)
