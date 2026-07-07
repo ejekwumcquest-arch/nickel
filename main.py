@@ -31,12 +31,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
+# ---------- Constants ----------
 JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60    # 2 days
+notified_members = set()                  # Prevent duplicate webhooks
 
 class Utils:
-    # ... (keep all Utils methods same as before) ...
-    # I'll keep them for brevity – copy from your previous script.
-
     def rangeCorrector(ranges):
         if [0, 99] not in ranges:
             ranges.insert(0, [0, 99])
@@ -102,7 +101,7 @@ class DiscordSocket(websocket.WebSocketApp):
         )
         self.endScraping = False
         self.guilds = {}
-        self.members = {}  # user_id -> (tag, joined_at or None)
+        self.members = {}
         self.ranges = [[0, 0]]
         self.lastRange = 0
         self.packets_recv = 0
@@ -186,7 +185,6 @@ class DiscordSocket(websocket.WebSocketApp):
                                         tag = f"{username}#{discrim}"
                                     else:
                                         tag = f"@{username}"
-                                    # Extract joined_at if available
                                     joined_at = mem.get('joined_at')
                                     self.members[user_id] = (tag, joined_at)
 
@@ -308,8 +306,12 @@ def process_new_members(new_members_dict, token):
             join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
             age = (now - join_time).total_seconds()
             if age <= JOIN_WINDOW_SECONDS:
+                if member_id in notified_members:
+                    logging.debug("Member %s already notified, skipping.", member_id)
+                    continue
                 logging.info("✅ New member (within %.0f days): %s (%s)", JOIN_WINDOW_SECONDS/86400, member_id, tag)
                 send_webhook(member_id, join_time, tag)
+                notified_members.add(member_id)
             else:
                 logging.debug("Member %s joined %.1f days ago – skipped", member_id, age/86400)
         except Exception as e:
@@ -319,7 +321,7 @@ def process_new_members(new_members_dict, token):
 
 
 if __name__ == '__main__':
-    logging.info("Starting scraper (10s interval, %.0f-day join window)...", JOIN_WINDOW_SECONDS/86400)
+    logging.info("Starting scraper (60s interval, %.0f-day join window)...", JOIN_WINDOW_SECONDS/86400)
 
     # HTTP server for keep-alive
     try:
@@ -357,4 +359,4 @@ if __name__ == '__main__':
             process_new_members(diff_dict, token)
 
         current_ids = new_ids
-        time.sleep(60)
+        time.sleep(60)   # Scan every 60 seconds
