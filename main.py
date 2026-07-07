@@ -202,11 +202,9 @@ class DiscordSocket(websocket.WebSocketApp):
             op = decoded.get("op")
             t = decoded.get("t")
 
-            # Log every event type
             if t:
                 logging.info(f"📩 Received event: {t}")
                 if t == "GUILD_MEMBER_LIST_UPDATE":
-                    # Log a snippet of the raw message
                     logging.info(f"📄 GUILD_MEMBER_LIST_UPDATE snippet: {message[:500]}")
 
             if op != 11:
@@ -216,11 +214,9 @@ class DiscordSocket(websocket.WebSocketApp):
                 threading.Thread(target=self.heartbeatThread, args=(decoded["d"]["heartbeat_interval"] / 1000,), daemon=True).start()
 
             if t == "READY":
-                # Log raw READY (first 1000 chars) to see if we get guilds
                 logging.info(f"📄 RAW READY: {json.dumps(decoded, indent=2)[:1000]}")
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
-                # Log found guilds
                 logging.info(f"🏛️ Guilds in READY: {list(self.guilds.keys())}")
 
             if t == "READY_SUPPLEMENTAL":
@@ -232,7 +228,6 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.scrapeUsers()
                 else:
                     logging.warning("⚠️ Member count is 0 – cannot scrape.")
-                    # fallback: try default ranges
                     self.ranges = Utils.getRanges(0, 100, 1000)
                     self.scrapeUsers()
 
@@ -246,10 +241,13 @@ class DiscordSocket(websocket.WebSocketApp):
                         elif not isinstance(updates, list):
                             updates = []
 
+                        logging.info(f"🔍 Processing {len(updates)} items for type {index}")
+
                         if index == "SYNC":
                             if len(updates) == 0:
                                 self.endScraping = True
                                 break
+                            added = 0
                             for item in updates:
                                 if "member" in item:
                                     mem = item["member"]
@@ -259,19 +257,26 @@ class DiscordSocket(websocket.WebSocketApp):
                                     user_id = user.get("id")
                                     if not user_id:
                                         continue
+                                    # Check blacklists
                                     if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
+                                        logging.debug(f"⛔ {user_id} blocked by role")
                                         continue
                                     if user.get("bot"):
+                                        logging.debug(f"⛔ {user_id} is a bot")
                                         continue
                                     if user_id in self.blacklisted_users:
+                                        logging.debug(f"⛔ {user_id} blacklisted user")
                                         continue
                                     username = user.get('username', 'Unknown')
                                     discrim = user.get('discriminator', '0')
                                     tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                                     joined_at = mem.get('joined_at')
                                     self.members[user_id] = (tag, joined_at)
+                                    added += 1
+                            logging.info(f"✅ Added {added} members from SYNC")
 
                         elif index == "UPDATE":
+                            added = 0
                             for item in updates:
                                 if "member" in item:
                                     mem = item["member"]
@@ -292,6 +297,8 @@ class DiscordSocket(websocket.WebSocketApp):
                                     tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                                     joined_at = mem.get('joined_at')
                                     self.members[user_id] = (tag, joined_at)
+                                    added += 1
+                            logging.info(f"✅ Added {added} members from UPDATE")
 
                         self.lastRange += 1
                         self.ranges = Utils.getRanges(self.lastRange, 100, self.guilds.get(self.guild_id, {}).get("member_count", 0))
