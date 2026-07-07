@@ -10,16 +10,28 @@ if 'DISCORD_TOKEN' in os.environ:
     proxy = os.environ.get('DISCORD_PROXY', '')
     blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
     blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
-    scan_interval = int(os.environ.get('SCAN_INTERVAL', '30'))
+    scan_interval = int(os.environ.get('SCAN_INTERVAL', '60'))
 else:
     from json import load
     config = load(open('config.json'))
-    guildId, channelId, proxy, token, webhook, blacklistedRoles, blacklistedUsers = (
-        config['guildID'], config['channelId'], config['proxy'],
-        config['token'], config['webhook'],
-        config['blacklistedRoles'], config['blacklistedUsers']
-    )
-    scan_interval = 30
+    guildId = config.get('guildID')
+    channelId = config.get('channelId')
+    token = config.get('token')
+    webhook = config.get('webhook')
+    proxy = config.get('proxy', '')
+    blacklistedRoles = config.get('blacklistedRoles', [])
+    blacklistedUsers = config.get('blacklistedUsers', [])
+    scan_interval = 60
+
+# Validate required values
+if not token:
+    raise ValueError("DISCORD_TOKEN is not set.")
+if not guildId:
+    raise ValueError("DISCORD_GUILD_ID is not set.")
+if not channelId:
+    raise ValueError("DISCORD_CHANNEL_ID is not set.")
+if not webhook:
+    raise ValueError("DISCORD_WEBHOOK is not set.")
 
 try:
     import websocket
@@ -125,12 +137,54 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
-        # Use the exact payload format from the original working script
-        self.send('{"op":14,"d":{"guild_id":"' + self.guild_id + '","typing":true,"activities":true,"threads":true,"channels":{"' + self.channel_id + '":' + json.dumps(self.ranges) + '}}}')
+        # Build payload safely with json.dumps
+        payload = {
+            "op": 14,
+            "d": {
+                "guild_id": self.guild_id,
+                "typing": True,
+                "activities": True,
+                "threads": True,
+                "channels": {self.channel_id: self.ranges}
+            }
+        }
+        self.send(json.dumps(payload))
 
     def sock_open(self, ws):
-        # Use the exact identify payload that worked before
-        self.send('{"op":2,"d":{"token":"' + self.token + '","capabilities":125,"properties":{"os":"Windows","browser":"Firefox","device":"","system_locale":"it-IT","browser_user_agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0","browser_version":"94.0","os_version":"10","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":103981,"client_event_source":null},"presence":{"status":"online","since":0,"activities":[],"afk":false},"compress":false,"client_state":{"guild_hashes":{},"highest_last_message_id":"0","read_state_version":0,"user_guild_settings_version":-1,"user_settings_version":-1}}}')
+        # Use the exact identify payload that worked before (but safer: json.dumps)
+        identify = {
+            "op": 2,
+            "d": {
+                "token": self.token,
+                "capabilities": 125,
+                "properties": {
+                    "os": "Windows",
+                    "browser": "Firefox",
+                    "device": "",
+                    "system_locale": "it-IT",
+                    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
+                    "browser_version": "94.0",
+                    "os_version": "10",
+                    "referrer": "",
+                    "referring_domain": "",
+                    "referrer_current": "",
+                    "referring_domain_current": "",
+                    "release_channel": "stable",
+                    "client_build_number": 103981,
+                    "client_event_source": None
+                },
+                "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
+                "compress": False,
+                "client_state": {
+                    "guild_hashes": {},
+                    "highest_last_message_id": "0",
+                    "read_state_version": 0,
+                    "user_guild_settings_version": -1,
+                    "user_settings_version": -1
+                }
+            }
+        }
+        self.send(json.dumps(identify))
 
     def heartbeatThread(self, interval):
         try:
@@ -355,6 +409,9 @@ if __name__ == '__main__':
         logging.info("HTTP health check server started on port %s", os.environ.get('PORT', 10000))
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
+
+    # Log config values to help debug
+    logging.info("Configuration: guildId=%s, channelId=%s, token starts with %s...", guildId, channelId, token[:8])
 
     logging.info("Building initial baseline...")
     current_members_raw = autoSnitch(token, guildId, channelId)
