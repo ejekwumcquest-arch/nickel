@@ -3,18 +3,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- Read configuration with robust parsing ----------
 def safe_json_parse(value, fallback=None):
-    """Try to parse JSON, return fallback on error."""
     if not value:
         return fallback
     try:
         return json.loads(value)
     except:
-        # If it's a simple comma-separated list, split it
         if ',' in value:
             return [x.strip().strip('"').strip("'") for x in value.split(',') if x.strip()]
-        # Fallback: treat as a single value if it looks like a string
         if value.startswith('[') and value.endswith(']'):
-            # Try to clean up common issues: replace single quotes with double
             cleaned = value.replace("'", '"')
             try:
                 return json.loads(cleaned)
@@ -25,9 +21,7 @@ def safe_json_parse(value, fallback=None):
 if 'DISCORD_TOKEN' in os.environ:
     token = os.environ.get('DISCORD_TOKEN')
     guildId = os.environ.get('DISCORD_GUILD_ID')
-    # Parse channel IDs
     channel_ids = safe_json_parse(os.environ.get('DISCORD_CHANNEL_IDS'), [])
-    # Fallback to single channel if provided and no array
     if not channel_ids and os.environ.get('DISCORD_CHANNEL_ID'):
         channel_ids = [os.environ.get('DISCORD_CHANNEL_ID')]
     webhook = os.environ.get('DISCORD_WEBHOOK')
@@ -38,6 +32,7 @@ if 'DISCORD_TOKEN' in os.environ:
     tokens = safe_json_parse(os.environ.get('DISCORD_TOKENS'), [])
     if not tokens and token:
         tokens = [token]
+    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '30'))  # seconds
 else:
     from json import load
     config = load(open('config.json'))
@@ -49,14 +44,12 @@ else:
     blacklistedRoles = config.get('blacklistedRoles', [])
     blacklistedUsers = config.get('blacklistedUsers', [])
     scan_interval = 60
+    baseline_timeout = 30
 
-# Ensure lists
 if not isinstance(channel_ids, list):
     channel_ids = [channel_ids] if channel_ids else []
 if not isinstance(tokens, list):
     tokens = [tokens] if tokens else []
-
-# Remove any empty or None values
 channel_ids = [c for c in channel_ids if c]
 tokens = [t for t in tokens if t]
 
@@ -90,7 +83,7 @@ def save_notified_cache():
     with open(NOTIFIED_CACHE_FILE, 'wb') as f:
         pickle.dump(notified_members, f)
 
-# ---------- Utils (unchanged) ----------
+# ---------- Utils ----------
 class Utils:
     def rangeCorrector(ranges):
         if [0, 99] not in ranges:
@@ -131,14 +124,15 @@ class Utils:
                     memberdata['updates'].append(chunk['item'])
         return memberdata
 
-# ---------- DiscordSocket (multi‑channel) ----------
+# ---------- DiscordSocket ----------
 class DiscordSocket(websocket.WebSocketApp):
-    def __init__(self, token, guild_id, channel_ids):
+    def __init__(self, token, guild_id, channel_ids, timeout_seconds=baseline_timeout):
         self.token = token
         self.guild_id = guild_id
         self.channel_ids = channel_ids if isinstance(channel_ids, list) else [channel_ids]
         self.blacklisted_roles = [str(r) for r in blacklistedRoles]
         self.blacklisted_users = [str(u) for u in blacklistedUsers]
+        self.timeout_seconds = timeout_seconds
 
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
@@ -163,6 +157,8 @@ class DiscordSocket(websocket.WebSocketApp):
         self.packets_recv = 0
         self.total_member_count = 0
         self.channels_completed = 0
+        self.start_time = time.time()
+        self.received_events = []
 
     def run(self):
         self.run_forever()
@@ -170,6 +166,10 @@ class DiscordSocket(websocket.WebSocketApp):
 
     def scrapeUsers(self):
         if self.endScraping:
+            return
+        # Only send if ranges are valid (not empty)
+        if not self.ranges or not self.ranges[0]:
+            logging.warning("Ranges empty, not scraping.")
             return
         channels_payload = {cid: self.ranges for cid in self.channel_ids}
         payload = {
@@ -204,6 +204,11 @@ class DiscordSocket(websocket.WebSocketApp):
             op = decoded.get("op")
             t = decoded.get("t")
 
+            # Log every event type for debugging
+            if t:
+                logging.debug(f"Received event: {t}")
+                self.received_events.append(t)
+
             if op != 11:
                 self.packets_recv += 1
 
@@ -214,19 +219,27 @@ class DiscordSocket(websocket.WebSocketApp):
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
                 self.total_member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
+                logging.info(f"READY: Guild {self.guild_id} has {self.total_member_count} members")
 
             if t == "READY_SUPPLEMENTAL":
+                logging.info("READY_SUPPLEMENTAL received")
                 if self.total_member_count:
                     self.ranges = Utils.getRanges(0, 100, self.total_member_count)
                     self.scrapeUsers()
+                else:
+                    logging.warning("No member count, using default ranges.")
+                    self.ranges = Utils.getRanges(0, 100, 1000)  # fallback
+                    self.scrapeUsers()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
+                logging.info("GUILD_MEMBER_LIST_UPDATE received")
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
                 if parsed['guild_id'] != self.guild_id:
                     return
 
                 channel_id = parsed.get('id')
                 if channel_id not in self.channel_ids:
+                    logging.debug(f"Update for channel {channel_id} not in our list, ignoring")
                     return
 
                 if 'SYNC' in parsed['types'] or 'UPDATE' in parsed['types']:
@@ -239,7 +252,9 @@ class DiscordSocket(websocket.WebSocketApp):
 
                         if index == "SYNC":
                             if len(updates) == 0:
+                                # one channel finished
                                 self.channels_completed += 1
+                                logging.info(f"Channel {channel_id} completed ({self.channels_completed}/{len(self.channel_ids)})")
                                 if self.channels_completed >= len(self.channel_ids):
                                     self.endScraping = True
                                     self.close()
@@ -300,11 +315,20 @@ class DiscordSocket(websocket.WebSocketApp):
                         self.ranges = Utils.getRanges(self.lastRange, 100, self.total_member_count)
                         self.scrapeUsers()
 
+                # Timeout check: if we've been waiting too long, force completion
+                if time.time() - self.start_time > self.timeout_seconds:
+                    logging.warning(f"Timeout ({self.timeout_seconds}s) reached, forcing completion with {len(self.members)} members.")
+                    self.endScraping = True
+                    self.close()
+
+            if self.endScraping:
+                self.close()
+
         except Exception as e:
-            logging.error("Error in sock_message: %s", e)
+            logging.error(f"Error in sock_message: {e}")
 
     def sock_close(self, ws, close_code, close_msg):
-        pass
+        logging.info(f"WebSocket closed: {close_code} - {close_msg}")
 
 
 def autoSnitch(token, guild_id, channel_ids):
@@ -401,14 +425,13 @@ def process_new_members(new_members_dict):
     logging.info("Finished processing %s new members.", total)
 
 
-# ---------- Main ----------
 if __name__ == '__main__':
     logging.info("Starting improved snitch (%ds interval, %d channel(s), %d token(s))",
                  scan_interval, len(channel_ids), len(tokens))
     logging.info("Channels: %s", channel_ids)
     logging.info("Tokens: %s", [t[:8]+"..." for t in tokens])
 
-    # HTTP keep‑alive server with HEAD support
+    # HTTP keep‑alive
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -427,7 +450,8 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
 
-    logging.info("Building initial baseline...")
+    # Baseline with timeout
+    logging.info("Building initial baseline (timeout %ds)...", baseline_timeout)
     combined_members = {}
     for i, t in enumerate(tokens):
         try:
@@ -447,6 +471,7 @@ if __name__ == '__main__':
     logging.info("Checking baseline members for recent joins...")
     process_new_members(combined_members)
 
+    # Main loop
     while True:
         all_new_members = {}
         for i, t in enumerate(tokens):
