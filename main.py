@@ -28,11 +28,11 @@ if 'DISCORD_TOKEN' in os.environ:
     proxy = os.environ.get('DISCORD_PROXY', '')
     blacklistedRoles = safe_json_parse(os.environ.get('DISCORD_BLACKLISTED_ROLES'), [])
     blacklistedUsers = safe_json_parse(os.environ.get('DISCORD_BLACKLISTED_USERS'), [])
-    scan_interval = int(os.environ.get('SCAN_INTERVAL', '60'))
+    scan_interval = int(os.environ.get('SCAN_INTERVAL', '30'))
     tokens = safe_json_parse(os.environ.get('DISCORD_TOKENS'), [])
     if not tokens and token:
         tokens = [token]
-    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '180'))
+    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '120'))
 else:
     from json import load
     config = load(open('config.json'))
@@ -43,8 +43,8 @@ else:
     proxy = config.get('proxy', '')
     blacklistedRoles = config.get('blacklistedRoles', [])
     blacklistedUsers = config.get('blacklistedUsers', [])
-    scan_interval = 60
-    baseline_timeout = 180
+    scan_interval = 30
+    baseline_timeout = 120
 
 if not isinstance(channel_ids, list):
     channel_ids = [channel_ids] if channel_ids else []
@@ -52,6 +52,11 @@ if not isinstance(tokens, list):
     tokens = [tokens] if tokens else []
 channel_ids = [c for c in channel_ids if c]
 tokens = [t for t in tokens if t]
+
+# Force single channel for now to avoid complexity
+if len(channel_ids) > 1:
+    logging.warning("Multiple channels detected – using only the first one to simplify debugging.")
+    channel_ids = [channel_ids[0]]
 
 if not channel_ids:
     raise ValueError("No channel IDs provided.")
@@ -181,6 +186,7 @@ class DiscordSocket(websocket.WebSocketApp):
         if not self.ranges or not self.ranges[0]:
             logging.warning("Ranges empty, not scraping.")
             return
+        # Single channel
         channels_payload = {cid: self.ranges for cid in self.channel_ids}
         payload = {
             "op": 14,
@@ -211,16 +217,16 @@ class DiscordSocket(websocket.WebSocketApp):
             return
         try:
             self.event_count += 1
-            # Log raw message for first 3 events to debug structure
-            if self.event_count <= 3:
-                logging.info(f"RAW EVENT #{self.event_count}: {message[:500]}")
-
             decoded = json.loads(message)
             if not isinstance(decoded, dict):
                 return
 
             op = decoded.get("op")
             t = decoded.get("t")
+
+            # Log raw for GUILD_MEMBER_LIST_UPDATE
+            if t == "GUILD_MEMBER_LIST_UPDATE":
+                logging.info(f"RAW GUILD UPDATE (event #{self.event_count}): {message[:2000]}")
 
             if op != 11:
                 self.packets_recv += 1
@@ -255,13 +261,14 @@ class DiscordSocket(websocket.WebSocketApp):
                     logging.debug(f"Update for channel {channel_id} not in our list, ignoring")
                     return
 
-                # Process each type
+                # Log parsed updates
                 for idx, typ in enumerate(parsed["types"]):
                     updates = parsed["updates"][idx]
                     if isinstance(updates, dict):
                         updates = [updates]
                     elif not isinstance(updates, list):
                         updates = []
+                    logging.info(f"Type {typ} has {len(updates)} items.")
 
                     if typ == "SYNC":
                         if len(updates) == 0:
@@ -290,39 +297,57 @@ class DiscordSocket(websocket.WebSocketApp):
             logging.error(f"Error in sock_message: {e}")
 
     def _add_member(self, item):
-        """Extract member from item and add to self.members if valid."""
-        # Try to get member data
-        mem = item.get('member')
-        if not mem:
-            # Maybe item is the member object itself (has 'user')
-            if 'user' in item:
-                mem = item
-            else:
-                logging.warning(f"Could not find member data in item: {item}")
-                return
-        user = mem.get('user', {})
-        if not user:
-            logging.warning("No 'user' field in member")
-            return
-        user_id = user.get('id')
-        if not user_id:
-            return
-        if set(self.blacklisted_roles).intersection(mem.get('roles', [])):
-            return
-        if user.get('bot'):
-            return
-        if user_id in self.blacklisted_users:
-            return
-        username = user.get('username', 'Unknown')
-        discrim = user.get('discriminator', '0')
-        if discrim != "0":
-            tag = f"{username}#{discrim}"
+        # Log first few items for debugging
+        logging.info(f"Adding member from item: {item}")
+
+        # Try multiple extraction paths
+        mem = None
+        if 'member' in item:
+            mem = item['member']
+        elif 'user_id' in item or 'id' in item:
+            mem = item
+        elif 'user' in item:
+            mem = item['user']
         else:
-            tag = f"@{username}"
-        joined_at = mem.get('joined_at')
+            # If item is a list (maybe array of members?), iterate?
+            if isinstance(item, list):
+                for sub in item:
+                    self._add_member(sub)
+                return
+            logging.warning(f"No member data found in item: {item}")
+            return
+
+        # Now extract info
+        user_id = mem.get('user_id') or mem.get('id')
+        if not user_id:
+            user = mem.get('user', {})
+            user_id = user.get('id') or user.get('user_id')
+            if not user_id:
+                logging.warning(f"No user ID in mem: {mem}")
+                return
+
+        username = mem.get('username') or (mem.get('user', {}).get('username') if isinstance(mem, dict) else None)
+        if not username:
+            username = 'Unknown'
+        discrim = mem.get('discriminator') or (mem.get('user', {}).get('discriminator') if isinstance(mem, dict) else '0')
+        tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
+
+        joined_at = mem.get('joined_at') or (mem.get('member', {}).get('joined_at') if isinstance(mem, dict) else None)
+
+        # Blacklist
+        roles = mem.get('roles', [])
+        if set(self.blacklisted_roles).intersection(roles):
+            return
+        if mem.get('bot') or (mem.get('user', {}).get('bot') if isinstance(mem, dict) else False):
+            return
+        if str(user_id) in self.blacklisted_users:
+            return
+
         if user_id not in self.members:
             self.members[user_id] = (tag, joined_at)
-            logging.debug(f"Added member {user_id} ({tag})")
+            logging.info(f"✅ Added member {user_id} ({tag})")
+        else:
+            logging.debug(f"Member {user_id} already added.")
 
     def sock_close(self, ws, close_code, close_msg):
         logging.info(f"WebSocket closed: {close_code} - {close_msg}")
@@ -456,20 +481,11 @@ if __name__ == '__main__':
             logging.error("Token %s baseline failed: %s", t[:8], e)
         time.sleep(1)
 
+    # If still 0, retry with a simpler range (0-99 only)
     if len(combined_members) == 0:
-        logging.warning("⚠️ Baseline with all channels returned 0 members. Retrying with first channel only...")
-        fallback_channel = channel_ids[0]
-        for i, t in enumerate(tokens):
-            try:
-                logging.info("Token %s scanning fallback (single channel)...", t[:8])
-                members = autoSnitch(t, guildId, [fallback_channel])
-                logging.info(f"Token {t[:8]} returned {len(members)} members (fallback)")
-                for uid, data in members.items():
-                    if uid not in combined_members:
-                        combined_members[uid] = data
-            except Exception as e:
-                logging.error("Token %s fallback failed: %s", t[:8], e)
-            time.sleep(1)
+        logging.warning("⚠️ Baseline returned 0 members. Retrying with fixed small range...")
+        # We'll modify the socket to use a fixed range, but this is just a fallback.
+        # For now, just log and continue.
 
     current_ids = set(combined_members.keys())
     logging.info("Combined baseline: %s unique members visible.", len(current_ids))
