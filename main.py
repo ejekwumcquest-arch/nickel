@@ -10,7 +10,7 @@ if 'DISCORD_TOKEN' in os.environ:
     proxy = os.environ.get('DISCORD_PROXY', '')
     blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
     blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
-    scan_interval = int(os.environ.get('SCAN_INTERVAL', '30'))  # seconds
+    scan_interval = int(os.environ.get('SCAN_INTERVAL', '30'))
 else:
     from json import load
     config = load(open('config.json'))
@@ -34,10 +34,9 @@ logging.basicConfig(
 )
 
 # ---------- Constants ----------
-JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60    # 2 days
+JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
 NOTIFIED_CACHE_FILE = "notified_members.pkl"
 
-# Load previously notified members from disk
 if os.path.exists(NOTIFIED_CACHE_FILE):
     with open(NOTIFIED_CACHE_FILE, 'rb') as f:
         notified_members = pickle.load(f)
@@ -114,7 +113,7 @@ class DiscordSocket(websocket.WebSocketApp):
         )
         self.endScraping = False
         self.guilds = {}
-        self.members = {}  # user_id -> (tag, joined_at or None)
+        self.members = {}
         self.ranges = [[0, 0]]
         self.lastRange = 0
         self.packets_recv = 0
@@ -124,8 +123,20 @@ class DiscordSocket(websocket.WebSocketApp):
         return self.members
 
     def scrapeUsers(self):
-        if not self.endScraping:
-            self.send('{"op":14,"d":{"guild_id":"' + self.guild_id + '","typing":true,"activities":true,"threads":true,"channels":{"' + self.channel_id + '":' + json.dumps(self.ranges) + '}}}')
+        if self.endScraping:
+            return
+        # Safer: build payload with json.dumps
+        payload = {
+            "op": 14,
+            "d": {
+                "guild_id": self.guild_id,
+                "typing": True,
+                "activities": True,
+                "threads": True,
+                "channels": {self.channel_id: self.ranges}
+            }
+        }
+        self.send(json.dumps(payload))
 
     def sock_open(self, ws):
         self.send('{"op":2,"d":{"token":"' + self.token + '","capabilities":125,"properties":{"os":"Windows","browser":"Firefox","device":"","system_locale":"it-IT","browser_user_agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0","browser_version":"94.0","os_version":"10","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":103981,"client_event_source":null},"presence":{"status":"online","since":0,"activities":[],"afk":false},"compress":false,"client_state":{"guild_hashes":{},"highest_last_message_id":"0","read_state_version":0,"user_guild_settings_version":-1,"user_settings_version":-1}}}')
@@ -194,10 +205,7 @@ class DiscordSocket(websocket.WebSocketApp):
                                         continue
                                     username = user.get('username', 'Unknown')
                                     discrim = user.get('discriminator', '0')
-                                    if discrim != "0":
-                                        tag = f"{username}#{discrim}"
-                                    else:
-                                        tag = f"@{username}"
+                                    tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                                     joined_at = mem.get('joined_at')
                                     self.members[user_id] = (tag, joined_at)
 
@@ -219,10 +227,7 @@ class DiscordSocket(websocket.WebSocketApp):
                                         continue
                                     username = user.get('username', 'Unknown')
                                     discrim = user.get('discriminator', '0')
-                                    if discrim != "0":
-                                        tag = f"{username}#{discrim}"
-                                    else:
-                                        tag = f"@{username}"
+                                    tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                                     joined_at = mem.get('joined_at')
                                     self.members[user_id] = (tag, joined_at)
 
@@ -234,7 +239,7 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.close()
 
         except Exception as e:
-            logging.error("Error in sock_message: %s", e)
+            logging.error(f"Error in sock_message: {e}")
 
     def sock_close(self, ws, close_code, close_msg):
         pass
@@ -303,7 +308,6 @@ def send_webhook(member_id, join_time, tag):
         logging.error("Webhook failed for %s: %s", member_id, e)
 
 def process_new_members(new_members_dict):
-    """new_members_dict: user_id -> (tag, joined_at or None)"""
     if not new_members_dict:
         return
 
@@ -316,6 +320,10 @@ def process_new_members(new_members_dict):
             logging.debug("Member %s has no joined_at, skipping", member_id)
             continue
         try:
+            # If joined_at is a string, convert; otherwise skip
+            if not isinstance(joined_at, str):
+                logging.debug("Member %s joined_at is not a string, skipping", member_id)
+                continue
             join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
             age = (now - join_time).total_seconds()
             if age <= JOIN_WINDOW_SECONDS:
