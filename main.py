@@ -2,66 +2,24 @@ import logging, os, datetime, time, json, threading, requests, httpx, tls_client
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- Read configuration ----------
-def safe_json_parse(value, fallback=None):
-    if not value:
-        return fallback
-    try:
-        return json.loads(value)
-    except:
-        if ',' in value:
-            return [x.strip().strip('"').strip("'") for x in value.split(',') if x.strip()]
-        if value.startswith('[') and value.endswith(']'):
-            cleaned = value.replace("'", '"')
-            try:
-                return json.loads(cleaned)
-            except:
-                pass
-        return fallback
-
 if 'DISCORD_TOKEN' in os.environ:
     token = os.environ.get('DISCORD_TOKEN')
     guildId = os.environ.get('DISCORD_GUILD_ID')
-    channel_ids = safe_json_parse(os.environ.get('DISCORD_CHANNEL_IDS'), [])
-    if not channel_ids and os.environ.get('DISCORD_CHANNEL_ID'):
-        channel_ids = [os.environ.get('DISCORD_CHANNEL_ID')]
+    channelId = os.environ.get('DISCORD_CHANNEL_ID')
     webhook = os.environ.get('DISCORD_WEBHOOK')
     proxy = os.environ.get('DISCORD_PROXY', '')
-    blacklistedRoles = safe_json_parse(os.environ.get('DISCORD_BLACKLISTED_ROLES'), [])
-    blacklistedUsers = safe_json_parse(os.environ.get('DISCORD_BLACKLISTED_USERS'), [])
-    scan_interval = int(os.environ.get('SCAN_INTERVAL', '30'))
-    tokens = safe_json_parse(os.environ.get('DISCORD_TOKENS'), [])
-    if not tokens and token:
-        tokens = [token]
-    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '120'))
+    blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
+    blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
+    scan_interval = int(os.environ.get('SCAN_INTERVAL', '30'))  # seconds
 else:
     from json import load
     config = load(open('config.json'))
-    guildId = config['guildID']
-    channel_ids = config.get('channelIds', [config.get('channelId')])
-    tokens = config.get('tokens', [config.get('token')])
-    webhook = config['webhook']
-    proxy = config.get('proxy', '')
-    blacklistedRoles = config.get('blacklistedRoles', [])
-    blacklistedUsers = config.get('blacklistedUsers', [])
+    guildId, channelId, proxy, token, webhook, blacklistedRoles, blacklistedUsers = (
+        config['guildID'], config['channelId'], config['proxy'],
+        config['token'], config['webhook'],
+        config['blacklistedRoles'], config['blacklistedUsers']
+    )
     scan_interval = 30
-    baseline_timeout = 120
-
-if not isinstance(channel_ids, list):
-    channel_ids = [channel_ids] if channel_ids else []
-if not isinstance(tokens, list):
-    tokens = [tokens] if tokens else []
-channel_ids = [c for c in channel_ids if c]
-tokens = [t for t in tokens if t]
-
-# Force single channel for now to avoid complexity
-if len(channel_ids) > 1:
-    logging.warning("Multiple channels detected – using only the first one to simplify debugging.")
-    channel_ids = [channel_ids[0]]
-
-if not channel_ids:
-    raise ValueError("No channel IDs provided.")
-if not tokens:
-    raise ValueError("No tokens provided.")
 
 try:
     import websocket
@@ -75,8 +33,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
+# ---------- Constants ----------
+JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60    # 2 days
 NOTIFIED_CACHE_FILE = "notified_members.pkl"
+
+# Load previously notified members from disk
 if os.path.exists(NOTIFIED_CACHE_FILE):
     with open(NOTIFIED_CACHE_FILE, 'rb') as f:
         notified_members = pickle.load(f)
@@ -127,14 +88,15 @@ class Utils:
                     memberdata['updates'].append(chunk['item'])
         return memberdata
 
+
 class DiscordSocket(websocket.WebSocketApp):
-    def __init__(self, token, guild_id, channel_ids, timeout_seconds=baseline_timeout):
+    def __init__(self, token, guild_id, channel_id):
         self.token = token
         self.guild_id = guild_id
-        self.channel_ids = channel_ids if isinstance(channel_ids, list) else [channel_ids]
+        self.channel_id = channel_id
         self.blacklisted_roles = [str(r) for r in blacklistedRoles]
         self.blacklisted_users = [str(u) for u in blacklistedUsers]
-        self.timeout_seconds = timeout_seconds
+
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
             "Accept-Language": "en-US,en;q=0.9",
@@ -152,56 +114,20 @@ class DiscordSocket(websocket.WebSocketApp):
         )
         self.endScraping = False
         self.guilds = {}
-        self.members = {}
+        self.members = {}  # user_id -> (tag, joined_at or None)
         self.ranges = [[0, 0]]
         self.lastRange = 0
         self.packets_recv = 0
-        self.total_member_count = 0
-        self.channels_completed = 0
-        self.start_time = time.time()
-        self.timeout_triggered = False
-        self.event_count = 0
-
-        self.timeout_thread = threading.Thread(target=self._timeout_monitor, daemon=True)
-        self.timeout_thread.start()
-
-    def _timeout_monitor(self):
-        time.sleep(self.timeout_seconds)
-        if not self.endScraping:
-            logging.warning(f"⏱️ Baseline timeout ({self.timeout_seconds}s) reached – forcing completion.")
-            self.timeout_triggered = True
-            self.endScraping = True
-            if hasattr(self, 'ws') and self.ws:
-                self.ws.close()
-            else:
-                self.close()
 
     def run(self):
         self.run_forever()
         return self.members
 
     def scrapeUsers(self):
-        if self.endScraping:
-            return
-        if not self.ranges or not self.ranges[0]:
-            logging.warning("Ranges empty, not scraping.")
-            return
-        # Single channel
-        channels_payload = {cid: self.ranges for cid in self.channel_ids}
-        payload = {
-            "op": 14,
-            "d": {
-                "guild_id": self.guild_id,
-                "typing": True,
-                "activities": True,
-                "threads": True,
-                "channels": channels_payload
-            }
-        }
-        self.send(json.dumps(payload))
+        if not self.endScraping:
+            self.send('{"op":14,"d":{"guild_id":"' + self.guild_id + '","typing":true,"activities":true,"threads":true,"channels":{"' + self.channel_id + '":' + json.dumps(self.ranges) + '}}}')
 
     def sock_open(self, ws):
-        self.ws = ws
         self.send('{"op":2,"d":{"token":"' + self.token + '","capabilities":125,"properties":{"os":"Windows","browser":"Firefox","device":"","system_locale":"it-IT","browser_user_agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0","browser_version":"94.0","os_version":"10","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":103981,"client_event_source":null},"presence":{"status":"online","since":0,"activities":[],"afk":false},"compress":false,"client_state":{"guild_hashes":{},"highest_last_message_id":"0","read_state_version":0,"user_guild_settings_version":-1,"user_settings_version":-1}}}')
 
     def heartbeatThread(self, interval):
@@ -213,20 +139,13 @@ class DiscordSocket(websocket.WebSocketApp):
             return
 
     def sock_message(self, ws, message):
-        if self.endScraping:
-            return
         try:
-            self.event_count += 1
             decoded = json.loads(message)
             if not isinstance(decoded, dict):
                 return
 
             op = decoded.get("op")
             t = decoded.get("t")
-
-            # Log raw for GUILD_MEMBER_LIST_UPDATE
-            if t == "GUILD_MEMBER_LIST_UPDATE":
-                logging.info(f"RAW GUILD UPDATE (event #{self.event_count}): {message[:2000]}")
 
             if op != 11:
                 self.packets_recv += 1
@@ -237,125 +156,92 @@ class DiscordSocket(websocket.WebSocketApp):
             if t == "READY":
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
-                self.total_member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
-                logging.info(f"READY: Guild {self.guild_id} has {self.total_member_count} members")
 
             if t == "READY_SUPPLEMENTAL":
-                logging.info("READY_SUPPLEMENTAL received")
-                if self.total_member_count:
-                    self.ranges = Utils.getRanges(0, 100, self.total_member_count)
-                    self.scrapeUsers()
-                else:
-                    logging.warning("No member count, using default ranges.")
-                    self.ranges = Utils.getRanges(0, 100, 1000)
+                member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
+                if member_count:
+                    self.ranges = Utils.getRanges(0, 100, member_count)
                     self.scrapeUsers()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
-                logging.info("GUILD_MEMBER_LIST_UPDATE received")
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
-                if parsed['guild_id'] != self.guild_id:
-                    return
+                if parsed['guild_id'] == self.guild_id and ('SYNC' in parsed['types'] or 'UPDATE' in parsed['types']):
+                    for elem, index in enumerate(parsed["types"]):
+                        updates = parsed["updates"][elem]
+                        if isinstance(updates, dict):
+                            updates = [updates]
+                        elif not isinstance(updates, list):
+                            updates = []
 
-                channel_id = parsed.get('id')
-                if channel_id not in self.channel_ids:
-                    logging.debug(f"Update for channel {channel_id} not in our list, ignoring")
-                    return
-
-                # Log parsed updates
-                for idx, typ in enumerate(parsed["types"]):
-                    updates = parsed["updates"][idx]
-                    if isinstance(updates, dict):
-                        updates = [updates]
-                    elif not isinstance(updates, list):
-                        updates = []
-                    logging.info(f"Type {typ} has {len(updates)} items.")
-
-                    if typ == "SYNC":
-                        if len(updates) == 0:
-                            self.channels_completed += 1
-                            logging.info(f"Channel {channel_id} completed ({self.channels_completed}/{len(self.channel_ids)})")
-                            if self.channels_completed >= len(self.channel_ids):
+                        if index == "SYNC":
+                            if len(updates) == 0:
                                 self.endScraping = True
-                                self.close()
-                            break
-                        for item in updates:
-                            self._add_member(item)
-                    elif typ == "UPDATE":
-                        for item in updates:
-                            self._add_member(item)
+                                break
+                            for item in updates:
+                                if "member" in item:
+                                    mem = item["member"]
+                                    user = mem.get("user", {})
+                                    if not user:
+                                        continue
+                                    user_id = user.get("id")
+                                    if not user_id:
+                                        continue
+                                    if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
+                                        continue
+                                    if user.get("bot"):
+                                        continue
+                                    if user_id in self.blacklisted_users:
+                                        continue
+                                    username = user.get('username', 'Unknown')
+                                    discrim = user.get('discriminator', '0')
+                                    if discrim != "0":
+                                        tag = f"{username}#{discrim}"
+                                    else:
+                                        tag = f"@{username}"
+                                    joined_at = mem.get('joined_at')
+                                    self.members[user_id] = (tag, joined_at)
 
-                if not self.endScraping:
-                    self.lastRange += 1
-                    self.ranges = Utils.getRanges(self.lastRange, 100, self.total_member_count)
-                    self.scrapeUsers()
+                        elif index == "UPDATE":
+                            for item in updates:
+                                if "member" in item:
+                                    mem = item["member"]
+                                    user = mem.get("user", {})
+                                    if not user:
+                                        continue
+                                    user_id = user.get("id")
+                                    if not user_id:
+                                        continue
+                                    if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
+                                        continue
+                                    if user.get("bot"):
+                                        continue
+                                    if user_id in self.blacklisted_users:
+                                        continue
+                                    username = user.get('username', 'Unknown')
+                                    discrim = user.get('discriminator', '0')
+                                    if discrim != "0":
+                                        tag = f"{username}#{discrim}"
+                                    else:
+                                        tag = f"@{username}"
+                                    joined_at = mem.get('joined_at')
+                                    self.members[user_id] = (tag, joined_at)
 
-            if self.timeout_triggered:
-                self.endScraping = True
-                self.close()
+                        self.lastRange += 1
+                        self.ranges = Utils.getRanges(self.lastRange, 100, self.guilds.get(self.guild_id, {}).get("member_count", 0))
+                        self.scrapeUsers()
+
+                if self.endScraping:
+                    self.close()
 
         except Exception as e:
-            logging.error(f"Error in sock_message: {e}")
-
-    def _add_member(self, item):
-        # Log first few items for debugging
-        logging.info(f"Adding member from item: {item}")
-
-        # Try multiple extraction paths
-        mem = None
-        if 'member' in item:
-            mem = item['member']
-        elif 'user_id' in item or 'id' in item:
-            mem = item
-        elif 'user' in item:
-            mem = item['user']
-        else:
-            # If item is a list (maybe array of members?), iterate?
-            if isinstance(item, list):
-                for sub in item:
-                    self._add_member(sub)
-                return
-            logging.warning(f"No member data found in item: {item}")
-            return
-
-        # Now extract info
-        user_id = mem.get('user_id') or mem.get('id')
-        if not user_id:
-            user = mem.get('user', {})
-            user_id = user.get('id') or user.get('user_id')
-            if not user_id:
-                logging.warning(f"No user ID in mem: {mem}")
-                return
-
-        username = mem.get('username') or (mem.get('user', {}).get('username') if isinstance(mem, dict) else None)
-        if not username:
-            username = 'Unknown'
-        discrim = mem.get('discriminator') or (mem.get('user', {}).get('discriminator') if isinstance(mem, dict) else '0')
-        tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
-
-        joined_at = mem.get('joined_at') or (mem.get('member', {}).get('joined_at') if isinstance(mem, dict) else None)
-
-        # Blacklist
-        roles = mem.get('roles', [])
-        if set(self.blacklisted_roles).intersection(roles):
-            return
-        if mem.get('bot') or (mem.get('user', {}).get('bot') if isinstance(mem, dict) else False):
-            return
-        if str(user_id) in self.blacklisted_users:
-            return
-
-        if user_id not in self.members:
-            self.members[user_id] = (tag, joined_at)
-            logging.info(f"✅ Added member {user_id} ({tag})")
-        else:
-            logging.debug(f"Member {user_id} already added.")
+            logging.error("Error in sock_message: %s", e)
 
     def sock_close(self, ws, close_code, close_msg):
-        logging.info(f"WebSocket closed: {close_code} - {close_msg}")
-        if self.timeout_triggered or self.endScraping:
-            return
+        pass
 
-def autoSnitch(token, guild_id, channel_ids):
-    sb = DiscordSocket(token, guild_id, channel_ids)
+
+def autoSnitch(token, guild_id, channel_id):
+    sb = DiscordSocket(token, guild_id, channel_id)
     return sb.run()
 
 def rotateProxy():
@@ -386,7 +272,7 @@ def session(token):
 
 def send_webhook(member_id, join_time, tag):
     try:
-        sess = session(tokens[0])
+        sess = session(token)
         guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
         guild_name = guild_resp.json().get('name', 'Unknown')
         if tag.startswith('@'):
@@ -417,10 +303,13 @@ def send_webhook(member_id, join_time, tag):
         logging.error("Webhook failed for %s: %s", member_id, e)
 
 def process_new_members(new_members_dict):
+    """new_members_dict: user_id -> (tag, joined_at or None)"""
     if not new_members_dict:
         return
+
     total = len(new_members_dict)
     logging.info("Processing %s new members...", total)
+
     now = datetime.datetime.now(datetime.timezone.utc)
     for member_id, (tag, joined_at) in new_members_dict.items():
         if not joined_at:
@@ -441,14 +330,14 @@ def process_new_members(new_members_dict):
                 logging.debug("Member %s joined %.1f days ago – skipped", member_id, age/86400)
         except Exception as e:
             logging.warning("Error processing %s: %s", member_id, e)
+
     logging.info("Finished processing %s new members.", total)
 
-if __name__ == '__main__':
-    logging.info("Starting improved snitch (%ds interval, %d channel(s), %d token(s))",
-                 scan_interval, len(channel_ids), len(tokens))
-    logging.info("Channels: %s", channel_ids)
-    logging.info("Tokens: %s", [t[:8]+"..." for t in tokens])
 
+if __name__ == '__main__':
+    logging.info("Starting snitch (%ds interval, 2-day join window)...", scan_interval)
+
+    # HTTP server for Render keep-alive (with HEAD support)
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -456,9 +345,11 @@ if __name__ == '__main__':
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"OK")
+
             def do_HEAD(self):
                 self.send_response(200)
                 self.end_headers()
+
         def run_http_server():
             server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler)
             server.serve_forever()
@@ -467,53 +358,25 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
 
-    logging.info("Building initial baseline (timeout %ds)...", baseline_timeout)
-    combined_members = {}
-    for i, t in enumerate(tokens):
-        try:
-            logging.info("Token %s scanning baseline...", t[:8])
-            members = autoSnitch(t, guildId, channel_ids)
-            logging.info(f"Token {t[:8]} returned {len(members)} members")
-            for uid, data in members.items():
-                if uid not in combined_members:
-                    combined_members[uid] = data
-        except Exception as e:
-            logging.error("Token %s baseline failed: %s", t[:8], e)
-        time.sleep(1)
-
-    # If still 0, retry with a simpler range (0-99 only)
-    if len(combined_members) == 0:
-        logging.warning("⚠️ Baseline returned 0 members. Retrying with fixed small range...")
-        # We'll modify the socket to use a fixed range, but this is just a fallback.
-        # For now, just log and continue.
-
-    current_ids = set(combined_members.keys())
-    logging.info("Combined baseline: %s unique members visible.", len(current_ids))
+    logging.info("Building initial baseline...")
+    current_members_raw = autoSnitch(token, guildId, channelId)
+    current_ids = set(current_members_raw.keys())
+    logging.info("Baseline built: %s members visible.", len(current_ids))
 
     logging.info("Checking baseline members for recent joins...")
-    process_new_members(combined_members)
+    process_new_members(current_members_raw)
 
     while True:
-        all_new_members = {}
-        for i, t in enumerate(tokens):
-            try:
-                members = autoSnitch(t, guildId, channel_ids)
-                for uid, data in members.items():
-                    if uid not in all_new_members:
-                        all_new_members[uid] = data
-            except Exception as e:
-                logging.error("Token %s scan failed: %s", t[:8], e)
-            time.sleep(0.5)
+        new_members_raw = autoSnitch(token, guildId, channelId)
+        new_ids = set(new_members_raw.keys())
+        logging.info("Scanned: %s members visible.", len(new_ids))
 
-        new_ids = set(all_new_members.keys()) - current_ids
-        if new_ids:
-            diff_dict = {uid: all_new_members[uid] for uid in new_ids}
-            logging.info("Found %s new IDs across all tokens.", len(diff_dict))
+        diff_ids = new_ids - current_ids
+        if diff_ids:
+            diff_dict = {uid: new_members_raw[uid] for uid in diff_ids}
+            logging.info("Found %s new IDs not in previous scan.", len(diff_dict))
             process_new_members(diff_dict)
-            current_ids.update(new_ids)
-        else:
-            logging.debug("No new IDs found.")
 
-        save_notified_cache()
+        current_ids = new_ids
         logging.info("Sleeping %s seconds...", scan_interval)
         time.sleep(scan_interval)
