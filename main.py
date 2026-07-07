@@ -172,7 +172,6 @@ class DiscordSocket(websocket.WebSocketApp):
             logging.warning(f"⏱️ Baseline timeout ({self.timeout_seconds}s) reached – forcing completion.")
             self.timeout_triggered = True
             self.endScraping = True
-            # Force close the WebSocket connection
             if hasattr(self, 'ws') and self.ws:
                 self.ws.close()
             else:
@@ -254,6 +253,7 @@ class DiscordSocket(websocket.WebSocketApp):
                 logging.info("GUILD_MEMBER_LIST_UPDATE received")
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
                 if parsed['guild_id'] != self.guild_id:
+                    logging.debug("Guild mismatch, ignoring")
                     return
 
                 channel_id = parsed.get('id')
@@ -261,13 +261,19 @@ class DiscordSocket(websocket.WebSocketApp):
                     logging.debug(f"Update for channel {channel_id} not in our list, ignoring")
                     return
 
+                # Log the types we see
+                logging.debug(f"Types in update: {parsed['types']}")
+
                 if 'SYNC' in parsed['types'] or 'UPDATE' in parsed['types']:
                     for elem, index in enumerate(parsed["types"]):
                         updates = parsed["updates"][elem]
+                        # Convert to list if needed
                         if isinstance(updates, dict):
                             updates = [updates]
                         elif not isinstance(updates, list):
                             updates = []
+
+                        logging.debug(f"Processing {len(updates)} items for {index}")
 
                         if index == "SYNC":
                             if len(updates) == 0:
@@ -278,55 +284,63 @@ class DiscordSocket(websocket.WebSocketApp):
                                     self.close()
                                 break
                             for item in updates:
-                                if "member" in item:
-                                    mem = item["member"]
-                                    user = mem.get("user", {})
-                                    if not user:
-                                        continue
-                                    user_id = user.get("id")
-                                    if not user_id:
-                                        continue
-                                    if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                        continue
-                                    if user.get("bot"):
-                                        continue
-                                    if user_id in self.blacklisted_users:
-                                        continue
-                                    username = user.get('username', 'Unknown')
-                                    discrim = user.get('discriminator', '0')
-                                    if discrim != "0":
-                                        tag = f"{username}#{discrim}"
-                                    else:
-                                        tag = f"@{username}"
-                                    joined_at = mem.get('joined_at')
-                                    if user_id not in self.members:
-                                        self.members[user_id] = (tag, joined_at)
+                                # Try to extract member
+                                mem = item.get('member')
+                                if not mem:
+                                    # Some updates might have a different structure
+                                    logging.warning("No 'member' key in item, skipping")
+                                    continue
+                                user = mem.get('user', {})
+                                if not user:
+                                    continue
+                                user_id = user.get('id')
+                                if not user_id:
+                                    continue
+                                if set(self.blacklisted_roles).intersection(mem.get('roles', [])):
+                                    continue
+                                if user.get('bot'):
+                                    continue
+                                if user_id in self.blacklisted_users:
+                                    continue
+                                username = user.get('username', 'Unknown')
+                                discrim = user.get('discriminator', '0')
+                                if discrim != "0":
+                                    tag = f"{username}#{discrim}"
+                                else:
+                                    tag = f"@{username}"
+                                joined_at = mem.get('joined_at')
+                                if user_id not in self.members:
+                                    self.members[user_id] = (tag, joined_at)
+                                    logging.debug(f"Added member {user_id} ({tag})")
 
                         elif index == "UPDATE":
                             for item in updates:
-                                if "member" in item:
-                                    mem = item["member"]
-                                    user = mem.get("user", {})
-                                    if not user:
-                                        continue
-                                    user_id = user.get("id")
-                                    if not user_id:
-                                        continue
-                                    if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                        continue
-                                    if user.get("bot"):
-                                        continue
-                                    if user_id in self.blacklisted_users:
-                                        continue
-                                    username = user.get('username', 'Unknown')
-                                    discrim = user.get('discriminator', '0')
-                                    if discrim != "0":
-                                        tag = f"{username}#{discrim}"
-                                    else:
-                                        tag = f"@{username}"
-                                    joined_at = mem.get('joined_at')
-                                    if user_id not in self.members:
-                                        self.members[user_id] = (tag, joined_at)
+                                mem = item.get('member')
+                                if not mem:
+                                    logging.warning("No 'member' key in UPDATE item, skipping")
+                                    continue
+                                user = mem.get('user', {})
+                                if not user:
+                                    continue
+                                user_id = user.get('id')
+                                if not user_id:
+                                    continue
+                                if set(self.blacklisted_roles).intersection(mem.get('roles', [])):
+                                    continue
+                                if user.get('bot'):
+                                    continue
+                                if user_id in self.blacklisted_users:
+                                    continue
+                                username = user.get('username', 'Unknown')
+                                discrim = user.get('discriminator', '0')
+                                if discrim != "0":
+                                    tag = f"{username}#{discrim}"
+                                else:
+                                    tag = f"@{username}"
+                                joined_at = mem.get('joined_at')
+                                if user_id not in self.members:
+                                    self.members[user_id] = (tag, joined_at)
+                                    logging.debug(f"Added member {user_id} ({tag})")
 
                     if not self.endScraping:
                         self.lastRange += 1
@@ -343,7 +357,6 @@ class DiscordSocket(websocket.WebSocketApp):
 
     def sock_close(self, ws, close_code, close_msg):
         logging.info(f"WebSocket closed: {close_code} - {close_msg}")
-        # If we closed due to timeout, don't wait for more events
         if self.timeout_triggered or self.endScraping:
             return
 
@@ -436,6 +449,7 @@ def process_new_members(new_members_dict):
             logging.warning("Error processing %s: %s", member_id, e)
     logging.info("Finished processing %s new members.", total)
 
+# ---------- Main ----------
 if __name__ == '__main__':
     logging.info("Starting improved snitch (%ds interval, %d channel(s), %d token(s))",
                  scan_interval, len(channel_ids), len(tokens))
@@ -463,17 +477,35 @@ if __name__ == '__main__':
 
     logging.info("Building initial baseline (timeout %ds)...", baseline_timeout)
     combined_members = {}
+
+    # Try with all channels
     for i, t in enumerate(tokens):
         try:
             logging.info("Token %s scanning baseline...", t[:8])
             members = autoSnitch(t, guildId, channel_ids)
+            logging.info(f"Token {t[:8]} returned {len(members)} members")
             for uid, data in members.items():
                 if uid not in combined_members:
                     combined_members[uid] = data
-            logging.info("Token %s added %s members", t[:8], len(members))
         except Exception as e:
             logging.error("Token %s baseline failed: %s", t[:8], e)
         time.sleep(1)
+
+    # If no members were collected, fall back to first channel only
+    if len(combined_members) == 0:
+        logging.warning("⚠️ Baseline with all channels returned 0 members. Retrying with first channel only...")
+        fallback_channel = channel_ids[0]
+        for i, t in enumerate(tokens):
+            try:
+                logging.info("Token %s scanning fallback (single channel)...", t[:8])
+                members = autoSnitch(t, guildId, [fallback_channel])
+                logging.info(f"Token {t[:8]} returned {len(members)} members (fallback)")
+                for uid, data in members.items():
+                    if uid not in combined_members:
+                        combined_members[uid] = data
+            except Exception as e:
+                logging.error("Token %s fallback failed: %s", t[:8], e)
+            time.sleep(1)
 
     current_ids = set(combined_members.keys())
     logging.info("Combined baseline: %s unique members visible.", len(current_ids))
