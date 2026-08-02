@@ -635,7 +635,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members if success else None
 
-# ---------- WebSocket fallback (original behaviour) ----------
+# ---------- WebSocket fallback (restored original logic) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, timeout=30):
         self.token = token
@@ -726,7 +726,8 @@ class DiscordSocket(websocket.WebSocketApp):
                     "read_state_version": 0,
                     "user_guild_settings_version": -1,
                     "user_settings_version": -1
-                }
+                },
+                "guild_subscriptions": False   # <-- ADDED: prevents large guild data, needed for member list scraping
             }
         }
         self.send(json.dumps(identify))
@@ -758,12 +759,12 @@ class DiscordSocket(websocket.WebSocketApp):
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
             if t == "READY_SUPPLEMENTAL":
+                # We no longer rely on member_count – we just start scraping
+                # but we keep it for logging purposes only.
                 self.member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
                 if self.member_count == 0:
-                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Closing socket.")
-                    self.close()
-                    return
-                self.timeout = max(30, self.member_count / 50)
+                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Still attempting to scrape.")
+                # Always start scraping from range [0,99]
                 self.ranges = [[0, 99]]
                 self.lastRange = 0
                 self.scrapeUsers()
@@ -771,6 +772,7 @@ class DiscordSocket(websocket.WebSocketApp):
                 parsed = self.parseGuildMemberListUpdate(decoded)
                 if parsed['guild_id'] != self.guild_id:
                     return
+                # Process updates
                 for elem, index in enumerate(parsed["types"]):
                     updates = parsed["updates"][elem]
                     if isinstance(updates, dict):
@@ -778,6 +780,7 @@ class DiscordSocket(websocket.WebSocketApp):
                     elif not isinstance(updates, list):
                         updates = []
                     if index == "SYNC":
+                        # If we get a SYNC with no items, we've reached the end
                         if len(updates) == 0:
                             self.endScraping = True
                             break
@@ -822,12 +825,11 @@ class DiscordSocket(websocket.WebSocketApp):
                                 tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                                 joined_at = mem.get('joined_at')
                                 self.members[user_id] = (tag, joined_at)
+                    # If we haven't finished, request the next range
                     if not self.endScraping:
                         self.lastRange += 1
                         next_start = self.lastRange * 100
-                        if self.member_count > 0 and next_start >= self.member_count:
-                            self.endScraping = True
-                            break
+                        # We don't know the total count, so we'll keep requesting until we get an empty SYNC
                         self.ranges = [[next_start, next_start + 99]]
                         self.scrapeUsers()
                 if self.endScraping:
