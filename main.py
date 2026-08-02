@@ -36,8 +36,8 @@ def load_config():
     guild_channel_pairs = []
     friend_tokens = {}
     MAX_CONCURRENT_SCANS = 3
-    FRIEND_REQUEST_WINDOW_MIN = 9000
-    FRIEND_REQUEST_WINDOW_MAX = 12600
+    FRIEND_REQUEST_WINDOW_MIN = 7200
+    FRIEND_REQUEST_WINDOW_MAX = 10800
     FRIEND_REQUEST_RETRY_MAX = 3
     FRIEND_REQUEST_RETRY_WINDOW = 86400
     GUILD_FAILURE_THRESHOLD = 3
@@ -68,8 +68,8 @@ def load_config():
         BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
         INDIVIDUAL_THRESHOLD = int(os.environ.get('INDIVIDUAL_THRESHOLD', '5'))
         MAX_CONCURRENT_SCANS = int(os.environ.get('MAX_CONCURRENT_SCANS', '3'))
-        FRIEND_REQUEST_WINDOW_MIN = int(os.environ.get('FRIEND_REQUEST_WINDOW_MIN', '9000'))
-        FRIEND_REQUEST_WINDOW_MAX = int(os.environ.get('FRIEND_REQUEST_WINDOW_MAX', '12600'))
+        FRIEND_REQUEST_WINDOW_MIN = int(os.environ.get('FRIEND_REQUEST_WINDOW_MIN', '7200'))
+        FRIEND_REQUEST_WINDOW_MAX = int(os.environ.get('FRIEND_REQUEST_WINDOW_MAX', '10800'))
         FRIEND_REQUEST_RETRY_MAX = int(os.environ.get('FRIEND_REQUEST_RETRY_MAX', '3'))
         FRIEND_REQUEST_RETRY_WINDOW = int(os.environ.get('FRIEND_REQUEST_RETRY_WINDOW', '86400'))
         GUILD_FAILURE_THRESHOLD = int(os.environ.get('GUILD_FAILURE_THRESHOLD', '3'))
@@ -133,8 +133,8 @@ def load_config():
             INDIVIDUAL_THRESHOLD = config.get('individual_threshold', 5)
             friend_tokens = config.get('friendTokens', {})
             MAX_CONCURRENT_SCANS = config.get('max_concurrent_scans', 3)
-            FRIEND_REQUEST_WINDOW_MIN = config.get('friend_request_window_min', 9000)
-            FRIEND_REQUEST_WINDOW_MAX = config.get('friend_request_window_max', 12600)
+            FRIEND_REQUEST_WINDOW_MIN = config.get('friend_request_window_min', 7200)
+            FRIEND_REQUEST_WINDOW_MAX = config.get('friend_request_window_max', 10800)
             FRIEND_REQUEST_RETRY_MAX = config.get('friend_request_retry_max', 3)
             FRIEND_REQUEST_RETRY_WINDOW = config.get('friend_request_retry_window', 86400)
             GUILD_FAILURE_THRESHOLD = config.get('guild_failure_threshold', 3)
@@ -411,7 +411,7 @@ class FriendRequestQueue:
                 logging.info("✅ Connected to MongoDB for friend request queue.")
             except Exception as e:
                 logging.error(f"❌ Failed to connect to MongoDB: {e}")
-                self.db = None
+                self.collection = None
         else:
             logging.warning("MONGODB_URI not set – queue will be in-memory only (lost on restart).")
 
@@ -419,7 +419,7 @@ class FriendRequestQueue:
         with self.lock:
             if user_id in self.sent_cache[token]:
                 return
-            if self.collection:
+            if self.collection is not None:
                 existing = self.collection.find_one({'token': token, 'user_id': user_id, 'status': 'pending'})
                 if existing:
                     self.sent_cache[token].add(user_id)
@@ -434,7 +434,7 @@ class FriendRequestQueue:
                 'status': 'pending',
                 'timestamp': time.time()
             }
-            if self.collection:
+            if self.collection is not None:
                 self.collection.insert_one(doc)
             else:
                 if not hasattr(self, '_memory_queue'):
@@ -444,7 +444,7 @@ class FriendRequestQueue:
 
     def pop(self, token):
         with self.lock:
-            if self.collection:
+            if self.collection is not None:
                 doc = self.collection.find_one_and_update(
                     {'token': token, 'status': 'pending'},
                     {'$set': {'status': 'processing'}},
@@ -460,14 +460,14 @@ class FriendRequestQueue:
                 return None
 
     def mark_done(self, token, user_id):
-        if self.collection:
+        if self.collection is not None:
             self.collection.delete_one({'token': token, 'user_id': user_id})
         with self.lock:
             if token in self.sent_cache and user_id in self.sent_cache[token]:
                 self.sent_cache[token].remove(user_id)
 
     def total_size(self):
-        if self.collection:
+        if self.collection is not None:
             return self.collection.count_documents({'status': 'pending'})
         else:
             if hasattr(self, '_memory_queue'):
@@ -475,7 +475,7 @@ class FriendRequestQueue:
             return 0
 
     def size(self, token):
-        if self.collection:
+        if self.collection is not None:
             return self.collection.count_documents({'token': token, 'status': 'pending'})
         else:
             if hasattr(self, '_memory_queue'):
@@ -635,7 +635,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members if success else None
 
-# ---------- WebSocket fallback ----------
+# ---------- WebSocket fallback (with fallback for member_count=0) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, timeout=30):
         self.token = token
@@ -670,6 +670,7 @@ class DiscordSocket(websocket.WebSocketApp):
         self.heartbeat_interval = None
         self.heartbeat_thread = None
         self.member_count = 0
+        self.ready_supplemental_received = False
 
     def run(self):
         timer = threading.Timer(self.timeout, self.close)
@@ -758,11 +759,11 @@ class DiscordSocket(websocket.WebSocketApp):
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
             if t == "READY_SUPPLEMENTAL":
+                self.ready_supplemental_received = True
                 self.member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
                 if self.member_count == 0:
-                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Closing socket.")
-                    self.close()
-                    return
+                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Using fallback range [0, 9999].")
+                    self.member_count = 9999  # fallback: assume at most 9999 members
                 self.timeout = max(30, self.member_count / 50)
                 self.ranges = [[0, 99]]
                 self.lastRange = 0
@@ -1225,7 +1226,7 @@ if __name__ == '__main__':
     load_config()
 
     # Initialise friend queue with the configured MONGODB_URI
-    friend_queue = FriendRequestQueue(MONGODB_URI)   # <-- removed 'global'
+    friend_queue = FriendRequestQueue(MONGODB_URI)
 
     logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
     threading.Thread(target=run_health_server, daemon=True).start()
