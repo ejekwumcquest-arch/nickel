@@ -3,3 +3,4 @@ httpx
 tls_client
 websocket-client
 typing_extensions
+pymongo
