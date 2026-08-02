@@ -635,7 +635,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members if success else None
 
-# ---------- WebSocket fallback (with fallback for member_count=0) ----------
+# ---------- WebSocket fallback (original behaviour) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, timeout=30):
         self.token = token
@@ -670,7 +670,6 @@ class DiscordSocket(websocket.WebSocketApp):
         self.heartbeat_interval = None
         self.heartbeat_thread = None
         self.member_count = 0
-        self.ready_supplemental_received = False
 
     def run(self):
         timer = threading.Timer(self.timeout, self.close)
@@ -759,11 +758,11 @@ class DiscordSocket(websocket.WebSocketApp):
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
             if t == "READY_SUPPLEMENTAL":
-                self.ready_supplemental_received = True
                 self.member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
                 if self.member_count == 0:
-                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Using fallback range [0, 9999].")
-                    self.member_count = 9999  # fallback: assume at most 9999 members
+                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Closing socket.")
+                    self.close()
+                    return
                 self.timeout = max(30, self.member_count / 50)
                 self.ranges = [[0, 99]]
                 self.lastRange = 0
