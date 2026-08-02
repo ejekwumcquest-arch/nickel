@@ -234,7 +234,6 @@ def load_config():
         logging.warning("MONGODB_URI not set – friend request queue will be in-memory only (lost on restart).")
 
     validate_configuration()
-    # NEW: validate channels and auto-correct if needed
     validate_channels()
 
 # ---------- Logging ----------
@@ -276,7 +275,7 @@ def save_notified_cache():
     with open(NOTIFIED_CACHE_BACKUP, 'wb') as f:
         pickle.dump(notified_members, f)
 
-# ---------- NEW: Channel validation and auto-discovery ----------
+# ---------- Channel validation and auto-discovery ----------
 def validate_channel(guild_id, channel_id):
     """Check if the channel is a text channel and accessible."""
     try:
@@ -286,7 +285,7 @@ def validate_channel(guild_id, channel_id):
         resp = sess.get(f'https://discord.com/api/v9/channels/{channel_id}')
         if resp.status_code == 200:
             data = resp.json()
-            if data.get('type') == 0:  # 0 = text channel
+            if data.get('type') == 0:
                 return True
             else:
                 logging.warning(f"[Guild {guild_id}] Channel {channel_id} is not a text channel (type {data.get('type')}).")
@@ -310,8 +309,7 @@ def find_alternative_channel(guild_id):
             return None
         channels = resp.json()
         for ch in channels:
-            if ch.get('type') == 0:  # text channel
-                # Optionally check if we have permission (we can't easily check, but assume we do)
+            if ch.get('type') == 0:
                 logging.info(f"[Guild {guild_id}] Found alternative text channel {ch['id']} ('{ch.get('name')}')")
                 return ch['id']
         logging.warning(f"[Guild {guild_id}] No text channels found.")
@@ -695,7 +693,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members
 
-# ---------- WebSocket fallback (FIXED + improved logging) ----------
+# ---------- WebSocket fallback (FIXED) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -939,13 +937,11 @@ def fetch_all_members_via_websocket(guild_id, channel_id, max_retries=2):
                 all_members.update(result)
                 break
             else:
-                # If close code indicates invalid channel (e.g., 4000), try alternative channel
                 if sb.close_code == 4000 and "Unknown error" in str(sb.close_reason):
                     logging.warning(f"[Guild {guild_id}] Channel {channel_id} may be invalid. Trying to find alternative...")
                     alt = find_alternative_channel(guild_id)
                     if alt and alt != channel_id:
                         logging.info(f"[Guild {guild_id}] Retrying with alternative channel {alt}")
-                        # Recursive call with new channel (but limit recursion)
                         return fetch_all_members_via_websocket(guild_id, alt, max_retries=1)
                     else:
                         logging.warning(f"[Guild {guild_id}] No alternative channel found.")
@@ -1220,20 +1216,20 @@ def run_health_server():
     except Exception as e:
         logging.warning(f"Health server error: {e}")
 
-# ---------- Scan a single guild ----------
+# ---------- Scan a single guild (returns True on success, False on failure) ----------
 previous_members = {}
 
 def scan_guild(guild_id, channel_id):
     global previous_members
     if should_skip_guild(guild_id):
         logging.info(f"[Guild {guild_id}] Skipped due to previous failures.")
-        return
+        return False  # not actually scanned
     logging.info(f"[Guild {guild_id}] Scanning (channel {channel_id})...")
     current_members = fetch_all_members(guild_id, channel_id)
     if current_members is None:
         record_guild_failure(guild_id)
         logging.error(f"[Guild {guild_id}] Failed to fetch members.")
-        return
+        return False
     record_guild_success(guild_id)
     prev = previous_members.get(guild_id, {})
     prev_ids = set(prev.keys())
@@ -1246,6 +1242,7 @@ def scan_guild(guild_id, channel_id):
     else:
         logging.info(f"[Guild {guild_id}] No new members detected.")
     previous_members[guild_id] = current_members
+    return True
 
 # ---------- Webhook readiness ----------
 def wait_for_webhook_ready():
@@ -1303,15 +1300,19 @@ if __name__ == '__main__':
 
     previous_members = {}
 
-    # Initial baseline
-    for guild_id, channel_id in guild_channel_pairs:
+    # Initial baseline – waits only if the scan was successful
+    for idx, (guild_id, channel_id) in enumerate(guild_channel_pairs):
         logging.info(f"Building initial baseline for guild {guild_id}...")
-        scan_guild(guild_id, channel_id)
-        if guild_id != guild_channel_pairs[-1][0]:
-            logging.info(f"Waiting {scan_interval}s before next guild initial scan...")
-            time.sleep(scan_interval + random.uniform(0, 10))
+        success = scan_guild(guild_id, channel_id)
+        if idx != len(guild_channel_pairs) - 1:
+            if success:
+                logging.info(f"Waiting {scan_interval}s before next guild initial scan...")
+                time.sleep(scan_interval + random.uniform(0, 10))
+            else:
+                logging.info(f"Guild scan failed, moving to next guild without long delay (short 5s jitter).")
+                time.sleep(5 + random.uniform(0, 5))
 
-    # Main loop
+    # Main loop (concurrent scans, no inter‑guild waits)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_SCANS) as executor:
         while True:
             futures = []
