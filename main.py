@@ -39,7 +39,7 @@ class RateLimiter:
                 self.calls = 0
             self.calls += 1
 
-# ---------- Friend Request Rate Limiter (sliding window) ----------
+# ---------- Friend Request Rate Limiter ----------
 class FriendRequestLimiter:
     def __init__(self, max_requests, window_min, window_max):
         self.max_requests = max_requests
@@ -234,6 +234,8 @@ def load_config():
         logging.warning("MONGODB_URI not set – friend request queue will be in-memory only (lost on restart).")
 
     validate_configuration()
+    # NEW: validate channels and auto-correct if needed
+    validate_channels()
 
 # ---------- Logging ----------
 logging.basicConfig(
@@ -273,6 +275,68 @@ def save_notified_cache():
         pickle.dump(notified_members, f)
     with open(NOTIFIED_CACHE_BACKUP, 'wb') as f:
         pickle.dump(notified_members, f)
+
+# ---------- NEW: Channel validation and auto-discovery ----------
+def validate_channel(guild_id, channel_id):
+    """Check if the channel is a text channel and accessible."""
+    try:
+        limiter = get_rest_limiter(guild_id)
+        limiter.acquire()
+        sess = get_session()
+        resp = sess.get(f'https://discord.com/api/v9/channels/{channel_id}')
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('type') == 0:  # 0 = text channel
+                return True
+            else:
+                logging.warning(f"[Guild {guild_id}] Channel {channel_id} is not a text channel (type {data.get('type')}).")
+                return False
+        else:
+            logging.warning(f"[Guild {guild_id}] Channel {channel_id} inaccessible (status {resp.status_code}).")
+            return False
+    except Exception as e:
+        logging.warning(f"[Guild {guild_id}] Channel validation error: {e}")
+        return False
+
+def find_alternative_channel(guild_id):
+    """Fetch all channels in the guild and return the first text channel ID."""
+    try:
+        limiter = get_rest_limiter(guild_id)
+        limiter.acquire()
+        sess = get_session()
+        resp = sess.get(f'https://discord.com/api/v9/guilds/{guild_id}/channels')
+        if resp.status_code != 200:
+            logging.warning(f"[Guild {guild_id}] Could not fetch channels (status {resp.status_code}).")
+            return None
+        channels = resp.json()
+        for ch in channels:
+            if ch.get('type') == 0:  # text channel
+                # Optionally check if we have permission (we can't easily check, but assume we do)
+                logging.info(f"[Guild {guild_id}] Found alternative text channel {ch['id']} ('{ch.get('name')}')")
+                return ch['id']
+        logging.warning(f"[Guild {guild_id}] No text channels found.")
+        return None
+    except Exception as e:
+        logging.warning(f"[Guild {guild_id}] Error fetching channels: {e}")
+        return None
+
+def validate_channels():
+    global guild_channel_pairs
+    new_pairs = []
+    for guild_id, channel_id in guild_channel_pairs:
+        if validate_channel(guild_id, channel_id):
+            new_pairs.append((guild_id, channel_id))
+        else:
+            logging.warning(f"[Guild {guild_id}] Configured channel {channel_id} is invalid. Attempting to find an alternative...")
+            alt = find_alternative_channel(guild_id)
+            if alt:
+                new_pairs.append((guild_id, alt))
+                logging.info(f"[Guild {guild_id}] Using alternative channel {alt} instead of {channel_id}.")
+            else:
+                logging.error(f"[Guild {guild_id}] No valid text channel found. This guild will be skipped.")
+    guild_channel_pairs = new_pairs
+    if not guild_channel_pairs:
+        raise ValueError("No valid guild-channel pairs after validation.")
 
 # ---------- Configuration Validation ----------
 def validate_configuration():
@@ -315,7 +379,7 @@ def validate_configuration():
     if not guild_channel_pairs:
         raise ValueError("No valid guilds left after validation.")
 
-# ---------- Rate limiters for REST and WS ----------
+# ---------- Rate limiters ----------
 rest_limiters = {}
 ws_limiters = {}
 
@@ -567,7 +631,7 @@ def enqueue_friend_requests_for_guild(guild_id, pending_members):
         friend_queue.enqueue(friend_token, item['member_id'], item['tag'], guild_id)
     logging.info(f"[Guild {guild_id}] Enqueued {len(pending_members)} friend requests.")
 
-# ---------- REST member fetch (your version) ----------
+# ---------- REST member fetch ----------
 def fetch_all_members_rest(guild_id, max_retries=3):
     members = {}
     after = '0'
@@ -631,7 +695,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members
 
-# ---------- WebSocket fallback (FIXED) ----------
+# ---------- WebSocket fallback (FIXED + improved logging) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -665,6 +729,8 @@ class DiscordSocket(websocket.WebSocketApp):
         self.heartbeat_interval = None
         self.heartbeat_thread = None
         self.member_count = 0
+        self.close_code = None
+        self.close_reason = None
 
     def run(self, timeout=30):
         timer = threading.Timer(timeout, self.close)
@@ -677,7 +743,6 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
-        # FIX: Added logging to see OP14 requests
         logging.info(f"[Guild {self.guild_id}] Sending OP14 for range {self.ranges}")
         limiter = get_ws_limiter(self.guild_id)
         limiter.acquire()
@@ -743,7 +808,6 @@ class DiscordSocket(websocket.WebSocketApp):
             decoded = json.loads(message)
             if not isinstance(decoded, dict):
                 return
-            # FIX: Log every Gateway event to help debugging
             logging.info(f"[Guild {self.guild_id}] Gateway event: op={decoded.get('op')} t={decoded.get('t')}")
             op = decoded.get("op")
             t = decoded.get("t")
@@ -758,7 +822,6 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
             if t == "READY_SUPPLEMENTAL":
                 self.member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
-                # FIX: Do NOT close socket when member_count is 0 – just log a warning
                 if self.member_count == 0:
                     logging.warning(f"[Guild {self.guild_id}] Member count is 0. Continuing scrape anyway.")
                 self.ranges = [[0, 99]]
@@ -775,7 +838,6 @@ class DiscordSocket(websocket.WebSocketApp):
                     elif not isinstance(updates, list):
                         updates = []
                     if index == "SYNC":
-                        # FIX: Stop when we receive an empty SYNC (no more members)
                         if len(updates) == 0:
                             self.endScraping = True
                             break
@@ -820,13 +882,11 @@ class DiscordSocket(websocket.WebSocketApp):
                                 tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                                 joined_at = mem.get('joined_at')
                                 self.members[user_id] = (tag, joined_at)
-                    # FIX: After processing this chunk, request the next range regardless of member_count
                     if not self.endScraping:
                         self.lastRange += 1
                         next_start = self.lastRange * 100
                         self.ranges = [[next_start, next_start + 99]]
                         self.scrapeUsers()
-                # FIX: Close the socket only when we've finished scraping
                 if self.endScraping:
                     self.close()
         except Exception as e:
@@ -860,13 +920,15 @@ class DiscordSocket(websocket.WebSocketApp):
         return memberdata
 
     def sock_close(self, ws, close_code, close_msg):
+        self.close_code = close_code
+        self.close_reason = close_msg
+        logging.warning(f"[Guild {self.guild_id}] WebSocket closed: code={close_code}, reason={close_msg}")
         if close_msg and "Rate limited" in close_msg:
             self.rate_limited = True
             logging.warning(f"[Guild {self.guild_id}] Rate limit detected on channel {self.channel_id}.")
 
-def fetch_all_members_via_websocket(guild_id, channel_id):
+def fetch_all_members_via_websocket(guild_id, channel_id, max_retries=2):
     all_members = {}
-    max_retries = 2
     for attempt in range(max_retries):
         try:
             logging.info(f"[Guild {guild_id}] WS scanning channel {channel_id} (attempt {attempt+1}/{max_retries}) ...")
@@ -877,7 +939,17 @@ def fetch_all_members_via_websocket(guild_id, channel_id):
                 all_members.update(result)
                 break
             else:
-                if sb.rate_limited:
+                # If close code indicates invalid channel (e.g., 4000), try alternative channel
+                if sb.close_code == 4000 and "Unknown error" in str(sb.close_reason):
+                    logging.warning(f"[Guild {guild_id}] Channel {channel_id} may be invalid. Trying to find alternative...")
+                    alt = find_alternative_channel(guild_id)
+                    if alt and alt != channel_id:
+                        logging.info(f"[Guild {guild_id}] Retrying with alternative channel {alt}")
+                        # Recursive call with new channel (but limit recursion)
+                        return fetch_all_members_via_websocket(guild_id, alt, max_retries=1)
+                    else:
+                        logging.warning(f"[Guild {guild_id}] No alternative channel found.")
+                elif sb.rate_limited:
                     logging.warning(f"[Guild {guild_id}] Rate limited on WS for channel {channel_id}. Waiting 60s.")
                     time.sleep(60 + random.uniform(0, 10))
                 else:
