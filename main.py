@@ -631,7 +631,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members
 
-# ---------- WebSocket fallback (YOUR EXACT VERSION) ----------
+# ---------- WebSocket fallback (FIXED) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -677,6 +677,8 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
+        # FIX: Added logging to see OP14 requests
+        logging.info(f"[Guild {self.guild_id}] Sending OP14 for range {self.ranges}")
         limiter = get_ws_limiter(self.guild_id)
         limiter.acquire()
         payload = {
@@ -741,6 +743,8 @@ class DiscordSocket(websocket.WebSocketApp):
             decoded = json.loads(message)
             if not isinstance(decoded, dict):
                 return
+            # FIX: Log every Gateway event to help debugging
+            logging.info(f"[Guild {self.guild_id}] Gateway event: op={decoded.get('op')} t={decoded.get('t')}")
             op = decoded.get("op")
             t = decoded.get("t")
             if op != 11:
@@ -754,10 +758,9 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
             if t == "READY_SUPPLEMENTAL":
                 self.member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
+                # FIX: Do NOT close socket when member_count is 0 – just log a warning
                 if self.member_count == 0:
-                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Closing socket.")
-                    self.close()
-                    return
+                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Continuing scrape anyway.")
                 self.ranges = [[0, 99]]
                 self.lastRange = 0
                 self.scrapeUsers()
@@ -772,6 +775,7 @@ class DiscordSocket(websocket.WebSocketApp):
                     elif not isinstance(updates, list):
                         updates = []
                     if index == "SYNC":
+                        # FIX: Stop when we receive an empty SYNC (no more members)
                         if len(updates) == 0:
                             self.endScraping = True
                             break
@@ -816,14 +820,13 @@ class DiscordSocket(websocket.WebSocketApp):
                                 tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                                 joined_at = mem.get('joined_at')
                                 self.members[user_id] = (tag, joined_at)
+                    # FIX: After processing this chunk, request the next range regardless of member_count
                     if not self.endScraping:
                         self.lastRange += 1
                         next_start = self.lastRange * 100
-                        if self.member_count > 0 and next_start >= self.member_count:
-                            self.endScraping = True
-                            break
                         self.ranges = [[next_start, next_start + 99]]
                         self.scrapeUsers()
+                # FIX: Close the socket only when we've finished scraping
                 if self.endScraping:
                     self.close()
         except Exception as e:
