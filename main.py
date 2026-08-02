@@ -397,7 +397,7 @@ def get_session():
 # ---------- MongoDB Queue ----------
 class FriendRequestQueue:
     def __init__(self, mongodb_uri=None):
-        self.mongodb_uri = mongodb_uri or MONGODB_URI
+        self.mongodb_uri = mongodb_uri
         self.db = None
         self.collection = None
         self.sent_cache = defaultdict(set)
@@ -466,17 +466,6 @@ class FriendRequestQueue:
             if token in self.sent_cache and user_id in self.sent_cache[token]:
                 self.sent_cache[token].remove(user_id)
 
-    def mark_failed(self, token, user_id, attempt, max_attempts):
-        if self.collection:
-            if attempt < max_attempts:
-                self.collection.update_one(
-                    {'token': token, 'user_id': user_id},
-                    {'$set': {'attempt': attempt, 'status': 'pending'}}
-                )
-            else:
-                self.collection.delete_one({'token': token, 'user_id': user_id})
-        # In-memory fallback – we re-enqueue in worker
-
     def total_size(self):
         if self.collection:
             return self.collection.count_documents({'status': 'pending'})
@@ -494,13 +483,16 @@ class FriendRequestQueue:
             return 0
 
 # ---------- Friend Request Sender ----------
-friend_queue = FriendRequestQueue()
+friend_queue = None  # will be initialised in main
 
 def friend_request_worker(token):
     limiter = get_friend_limiter(token)
     logging.info(f"Friend worker started for token {token[:8]}...")
     while True:
         try:
+            if friend_queue is None:
+                time.sleep(5)
+                continue
             item = friend_queue.pop(token)
             if not item:
                 time.sleep(5)
@@ -1137,8 +1129,11 @@ def fetch_member_joined_at(guild_id, user_id):
 
 # ---------- Stats logging ----------
 def log_stats():
-    total_enqueued = friend_queue.total_size()
-    logging.info(f"📊 Stats: Friend requests enqueued: {total_enqueued}")
+    if friend_queue is not None:
+        total_enqueued = friend_queue.total_size()
+        logging.info(f"📊 Stats: Friend requests enqueued: {total_enqueued}")
+    else:
+        logging.info("📊 Stats: Friend queue not initialised.")
     for guild_id, _ in guild_channel_pairs:
         failures = guild_failure_counts.get(guild_id, 0)
         skipped = should_skip_guild(guild_id)
@@ -1228,6 +1223,10 @@ def wait_for_webhook_ready():
 # ---------- Main ----------
 if __name__ == '__main__':
     load_config()
+
+    # Initialise friend queue with the configured MONGODB_URI
+    global friend_queue
+    friend_queue = FriendRequestQueue(MONGODB_URI)
 
     logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
     threading.Thread(target=run_health_server, daemon=True).start()
