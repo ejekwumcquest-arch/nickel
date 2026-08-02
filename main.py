@@ -17,7 +17,64 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pymongo
 from pymongo import MongoClient, errors
 
-# ---------- Configuration ----------
+# ---------- RateLimiter ----------
+class RateLimiter:
+    def __init__(self, max_calls, period):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = 0
+        self.lock = Semaphore()
+        self.start = time.time()
+
+    def acquire(self):
+        with self.lock:
+            now = time.time()
+            if now - self.start > self.period:
+                self.start = now
+                self.calls = 0
+            if self.calls >= self.max_calls:
+                sleep_time = self.period - (now - self.start) + 0.1
+                time.sleep(max(0, sleep_time))
+                self.start = time.time()
+                self.calls = 0
+            self.calls += 1
+
+# ---------- Friend Request Rate Limiter (sliding window) ----------
+class FriendRequestLimiter:
+    def __init__(self, max_requests, window_min, window_max):
+        self.max_requests = max_requests
+        self.window_min = window_min
+        self.window_max = window_max
+        self.window = random.uniform(window_min, window_max)
+        self.timestamps = deque()
+        self.lock = Lock()
+
+    def can_send(self):
+        with self.lock:
+            now = time.time()
+            while self.timestamps and now - self.timestamps[0] > self.window:
+                self.timestamps.popleft()
+            return len(self.timestamps) < self.max_requests
+
+    def record_send(self):
+        with self.lock:
+            self.timestamps.append(time.time())
+
+    def wait_until_capacity(self):
+        while True:
+            if self.can_send():
+                return
+            with self.lock:
+                if self.timestamps:
+                    oldest = self.timestamps[0]
+                    sleep_until = oldest + self.window
+                    now = time.time()
+                    if sleep_until > now:
+                        time.sleep(sleep_until - now + random.uniform(1, 5))
+                else:
+                    time.sleep(random.uniform(1, 5))
+
+# ---------- Read configuration ----------
 def load_config():
     global token, webhook, proxy, blacklistedRoles, blacklistedUsers, scan_interval
     global BATCH_SIZE, INDIVIDUAL_THRESHOLD, guild_channel_pairs, friend_tokens
@@ -258,64 +315,7 @@ def validate_configuration():
     if not guild_channel_pairs:
         raise ValueError("No valid guilds left after validation.")
 
-# ---------- RateLimiter ----------
-class RateLimiter:
-    def __init__(self, max_calls, period):
-        self.max_calls = max_calls
-        self.period = period
-        self.calls = 0
-        self.lock = Semaphore()
-        self.start = time.time()
-
-    def acquire(self):
-        with self.lock:
-            now = time.time()
-            if now - self.start > self.period:
-                self.start = now
-                self.calls = 0
-            if self.calls >= self.max_calls:
-                sleep_time = self.period - (now - self.start) + 0.1
-                time.sleep(max(0, sleep_time))
-                self.start = time.time()
-                self.calls = 0
-            self.calls += 1
-
-# ---------- Friend Request Rate Limiter ----------
-class FriendRequestLimiter:
-    def __init__(self, max_requests, window_min, window_max):
-        self.max_requests = max_requests
-        self.window_min = window_min
-        self.window_max = window_max
-        self.window = random.uniform(window_min, window_max)
-        self.timestamps = deque()
-        self.lock = Lock()
-
-    def can_send(self):
-        with self.lock:
-            now = time.time()
-            while self.timestamps and now - self.timestamps[0] > self.window:
-                self.timestamps.popleft()
-            return len(self.timestamps) < self.max_requests
-
-    def record_send(self):
-        with self.lock:
-            self.timestamps.append(time.time())
-
-    def wait_until_capacity(self):
-        while True:
-            if self.can_send():
-                return
-            with self.lock:
-                if self.timestamps:
-                    oldest = self.timestamps[0]
-                    sleep_until = oldest + self.window
-                    now = time.time()
-                    if sleep_until > now:
-                        time.sleep(sleep_until - now + random.uniform(1, 5))
-                else:
-                    time.sleep(random.uniform(1, 5))
-
-# ---------- Rate limiters ----------
+# ---------- Rate limiters for REST and WS ----------
 rest_limiters = {}
 ws_limiters = {}
 
@@ -330,20 +330,6 @@ def get_ws_limiter(guild_id):
     return ws_limiters[guild_id]
 
 webhook_limiter = RateLimiter(2, 1)
-
-# ---------- Friend Request Limiters per token ----------
-friend_limiters = {}
-friend_limiters_lock = Lock()
-
-def get_friend_limiter(token):
-    with friend_limiters_lock:
-        if token not in friend_limiters:
-            friend_limiters[token] = FriendRequestLimiter(
-                max_requests=4,
-                window_min=FRIEND_REQUEST_WINDOW_MIN,
-                window_max=FRIEND_REQUEST_WINDOW_MAX
-            )
-        return friend_limiters[token]
 
 # ---------- Proxy validation ----------
 def is_valid_proxy_host(hostname):
@@ -394,7 +380,7 @@ def get_session():
                 logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return shared_session
 
-# ---------- MongoDB Queue ----------
+# ---------- Friend request queue (MongoDB) ----------
 class FriendRequestQueue:
     def __init__(self, mongodb_uri=None):
         self.mongodb_uri = mongodb_uri
@@ -482,8 +468,20 @@ class FriendRequestQueue:
                 return len(self._memory_queue.get(token, []))
             return 0
 
-# ---------- Friend Request Sender ----------
-friend_queue = None  # will be initialised in main
+# ---------- Friend workers ----------
+friend_queue = None
+friend_limiters = {}
+friend_limiters_lock = Lock()
+
+def get_friend_limiter(token):
+    with friend_limiters_lock:
+        if token not in friend_limiters:
+            friend_limiters[token] = FriendRequestLimiter(
+                max_requests=4,
+                window_min=FRIEND_REQUEST_WINDOW_MIN,
+                window_max=FRIEND_REQUEST_WINDOW_MAX
+            )
+        return friend_limiters[token]
 
 def friend_request_worker(token):
     limiter = get_friend_limiter(token)
@@ -569,12 +567,11 @@ def enqueue_friend_requests_for_guild(guild_id, pending_members):
         friend_queue.enqueue(friend_token, item['member_id'], item['tag'], guild_id)
     logging.info(f"[Guild {guild_id}] Enqueued {len(pending_members)} friend requests.")
 
-# ---------- REST member fetch ----------
+# ---------- REST member fetch (your version) ----------
 def fetch_all_members_rest(guild_id, max_retries=3):
     members = {}
     after = '0'
     retry_count = 0
-    success = False
     limiter = get_rest_limiter(guild_id)
     while True:
         try:
@@ -626,16 +623,15 @@ def fetch_all_members_rest(guild_id, max_retries=3):
                 break
             after = data[-1]['user']['id']
             retry_count = 0
-            success = True
         except Exception as e:
             logging.error(f"[Guild {guild_id}] REST fetch error: {e}")
             retry_count += 1
             if retry_count > max_retries:
                 break
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
-    return members if success else None
+    return members
 
-# ---------- WebSocket fallback (ORIGINAL WORKING VERSION) ----------
+# ---------- WebSocket fallback (YOUR EXACT VERSION) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -1211,7 +1207,7 @@ def wait_for_webhook_ready():
 if __name__ == '__main__':
     load_config()
 
-    # Initialise friend queue with the configured MONGODB_URI
+    # Initialise friend queue
     friend_queue = FriendRequestQueue(MONGODB_URI)
 
     logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
@@ -1232,6 +1228,7 @@ if __name__ == '__main__':
 
     previous_members = {}
 
+    # Initial baseline
     for guild_id, channel_id in guild_channel_pairs:
         logging.info(f"Building initial baseline for guild {guild_id}...")
         scan_guild(guild_id, channel_id)
@@ -1239,6 +1236,7 @@ if __name__ == '__main__':
             logging.info(f"Waiting {scan_interval}s before next guild initial scan...")
             time.sleep(scan_interval + random.uniform(0, 10))
 
+    # Main loop
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_SCANS) as executor:
         while True:
             futures = []
