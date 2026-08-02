@@ -14,6 +14,8 @@ from threading import Semaphore, Lock
 from urllib.parse import urlparse
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import pymongo
+from pymongo import MongoClient, errors
 
 # ---------- Configuration ----------
 def load_config():
@@ -21,7 +23,7 @@ def load_config():
     global BATCH_SIZE, INDIVIDUAL_THRESHOLD, guild_channel_pairs, friend_tokens
     global MAX_CONCURRENT_SCANS, FRIEND_REQUEST_WINDOW_MIN, FRIEND_REQUEST_WINDOW_MAX
     global FRIEND_REQUEST_RETRY_MAX, FRIEND_REQUEST_RETRY_WINDOW
-    global GUILD_FAILURE_THRESHOLD, GUILD_FAILURE_SKIP_SECONDS, DRY_RUN
+    global GUILD_FAILURE_THRESHOLD, GUILD_FAILURE_SKIP_SECONDS, DRY_RUN, MONGODB_URI
 
     token = None
     webhook = None
@@ -34,20 +36,21 @@ def load_config():
     guild_channel_pairs = []
     friend_tokens = {}
     MAX_CONCURRENT_SCANS = 3
-    FRIEND_REQUEST_WINDOW_MIN = 9000    # 2.5 hours
-    FRIEND_REQUEST_WINDOW_MAX = 12600   # 3.5 hours
+    FRIEND_REQUEST_WINDOW_MIN = 9000
+    FRIEND_REQUEST_WINDOW_MAX = 12600
     FRIEND_REQUEST_RETRY_MAX = 3
-    FRIEND_REQUEST_RETRY_WINDOW = 86400 # 24 hours
+    FRIEND_REQUEST_RETRY_WINDOW = 86400
     GUILD_FAILURE_THRESHOLD = 3
-    GUILD_FAILURE_SKIP_SECONDS = 3600   # 1 hour
+    GUILD_FAILURE_SKIP_SECONDS = 3600
     DRY_RUN = False
+    MONGODB_URI = None
 
-    # Environment variables first
     if 'DISCORD_TOKEN' in os.environ:
         token = os.environ['DISCORD_TOKEN']
         webhook = os.environ.get('DISCORD_WEBHOOK')
         proxy = os.environ.get('DISCORD_PROXY', '')
-        # Safe JSON parsing with fallback
+        MONGODB_URI = os.environ.get('MONGODB_URI')
+
         try:
             blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
         except:
@@ -73,7 +76,6 @@ def load_config():
         GUILD_FAILURE_SKIP_SECONDS = int(os.environ.get('GUILD_FAILURE_SKIP_SECONDS', '3600'))
         DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
 
-        # Parse guilds from DISCORD_GUILDS, DISCORD_GUILD_CONFIG, or parallel lists
         pairs_dict = {}
         if 'DISCORD_GUILDS' in os.environ:
             raw = os.environ['DISCORD_GUILDS']
@@ -117,13 +119,13 @@ def load_config():
         else:
             raise ValueError("No guild configuration found.")
     else:
-        # Fallback to config.json
         try:
             with open('config.json', 'r') as f:
                 config = json.load(f)
             token = config.get('token')
             webhook = config.get('webhook')
             proxy = config.get('proxy', '')
+            MONGODB_URI = config.get('mongodb_uri')
             blacklistedRoles = config.get('blacklistedRoles', [])
             blacklistedUsers = config.get('blacklistedUsers', [])
             scan_interval = config.get('scan_interval', 1800)
@@ -171,8 +173,9 @@ def load_config():
         raise ValueError("DISCORD_WEBHOOK is not set.")
     if not guild_channel_pairs:
         raise ValueError("No guild-channel pairs configured.")
+    if not MONGODB_URI:
+        logging.warning("MONGODB_URI not set – friend request queue will be in-memory only (lost on restart).")
 
-    # Validate guilds and tokens on startup (function defined later)
     validate_configuration()
 
 # ---------- Logging ----------
@@ -187,7 +190,7 @@ JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
 NOTIFIED_CACHE_FILE = "notified_members.pkl"
 NOTIFIED_CACHE_BACKUP = "notified_members_backup.pkl"
 
-# ---------- Cache handling with fallback ----------
+# ---------- Cache handling ----------
 def load_notified_cache():
     try:
         if os.path.exists(NOTIFIED_CACHE_FILE):
@@ -199,7 +202,6 @@ def load_notified_cache():
             if os.path.exists(NOTIFIED_CACHE_BACKUP):
                 with open(NOTIFIED_CACHE_BACKUP, 'rb') as f:
                     data = pickle.load(f)
-                # Restore main from backup
                 with open(NOTIFIED_CACHE_FILE, 'wb') as f:
                     pickle.dump(data, f)
                 return data
@@ -210,20 +212,16 @@ def load_notified_cache():
 notified_members = load_notified_cache()
 
 def save_notified_cache():
-    # Write to main
     with open(NOTIFIED_CACHE_FILE, 'wb') as f:
         pickle.dump(notified_members, f)
-    # Also write backup
     with open(NOTIFIED_CACHE_BACKUP, 'wb') as f:
         pickle.dump(notified_members, f)
 
 # ---------- Configuration Validation ----------
 def validate_configuration():
-    """Check that all guilds exist and friend tokens are valid."""
-    global guild_channel_pairs, friend_tokens  # <-- FIXED: moved to top
+    global guild_channel_pairs, friend_tokens
     logging.info("Validating configuration...")
     valid_guilds = []
-    # Validate guilds
     for guild_id, channel_id in guild_channel_pairs:
         try:
             limiter = get_rest_limiter(guild_id)
@@ -240,10 +238,8 @@ def validate_configuration():
                 logging.warning(f"❌ Guild {guild_id} validation failed ({resp.status_code}). Skipping.")
         except Exception as e:
             logging.warning(f"❌ Guild {guild_id} validation error: {e}. Skipping.")
-    # Update guild_channel_pairs with only valid ones
     guild_channel_pairs = valid_guilds
 
-    # Validate friend tokens
     for guild_id, token in list(friend_tokens.items()):
         try:
             sess = tls_client.Session(client_identifier='chrome_105')
@@ -284,13 +280,13 @@ class RateLimiter:
                 self.calls = 0
             self.calls += 1
 
-# ---------- Friend Request Rate Limiter (sliding window with random window) ----------
+# ---------- Friend Request Rate Limiter ----------
 class FriendRequestLimiter:
     def __init__(self, max_requests, window_min, window_max):
         self.max_requests = max_requests
         self.window_min = window_min
         self.window_max = window_max
-        self.window = random.uniform(window_min, window_max)  # randomised on creation
+        self.window = random.uniform(window_min, window_max)
         self.timestamps = deque()
         self.lock = Lock()
 
@@ -319,7 +315,7 @@ class FriendRequestLimiter:
                 else:
                     time.sleep(random.uniform(1, 5))
 
-# ---------- Rate limiters for REST/WS ----------
+# ---------- Rate limiters ----------
 rest_limiters = {}
 ws_limiters = {}
 
@@ -358,7 +354,7 @@ def is_valid_proxy_host(hostname):
     domain_re = r'^(?=.{1,253}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$'
     return bool(re.match(domain_re, hostname))
 
-# ---------- Global Session (scraper) ----------
+# ---------- Global Session ----------
 shared_session = None
 
 def get_session():
@@ -398,60 +394,130 @@ def get_session():
                 logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return shared_session
 
-# ---------- Friend Request Sender (with retry queue) ----------
+# ---------- MongoDB Queue ----------
 class FriendRequestQueue:
-    def __init__(self):
-        self.queue = defaultdict(list)  # token -> list of (user_id, tag, guild_id, attempt, first_try)
+    def __init__(self, mongodb_uri=None):
+        self.mongodb_uri = mongodb_uri or MONGODB_URI
+        self.db = None
+        self.collection = None
+        self.sent_cache = defaultdict(set)
         self.lock = Lock()
-        self.sent_cache = defaultdict(set)  # token -> set of user_id
+        if self.mongodb_uri:
+            try:
+                self.client = MongoClient(self.mongodb_uri, serverSelectionTimeoutMS=5000)
+                self.db = self.client['discord_snitch']
+                self.collection = self.db['friend_requests']
+                self.collection.create_index([('token', 1), ('timestamp', 1)])
+                logging.info("✅ Connected to MongoDB for friend request queue.")
+            except Exception as e:
+                logging.error(f"❌ Failed to connect to MongoDB: {e}")
+                self.db = None
+        else:
+            logging.warning("MONGODB_URI not set – queue will be in-memory only (lost on restart).")
 
     def enqueue(self, token, user_id, tag, guild_id, attempt=0):
         with self.lock:
-            if user_id not in self.sent_cache[token]:
-                self.queue[token].append((user_id, tag, guild_id, attempt, time.time()))
-                self.sent_cache[token].add(user_id)
+            if user_id in self.sent_cache[token]:
+                return
+            if self.collection:
+                existing = self.collection.find_one({'token': token, 'user_id': user_id, 'status': 'pending'})
+                if existing:
+                    self.sent_cache[token].add(user_id)
+                    return
+            doc = {
+                'token': token,
+                'user_id': user_id,
+                'tag': tag,
+                'guild_id': guild_id,
+                'attempt': attempt,
+                'first_try': time.time(),
+                'status': 'pending',
+                'timestamp': time.time()
+            }
+            if self.collection:
+                self.collection.insert_one(doc)
+            else:
+                if not hasattr(self, '_memory_queue'):
+                    self._memory_queue = defaultdict(list)
+                self._memory_queue[token].append((user_id, tag, guild_id, attempt, time.time()))
+            self.sent_cache[token].add(user_id)
 
     def pop(self, token):
         with self.lock:
-            if token in self.queue and self.queue[token]:
-                return self.queue[token].pop(0)
-            return None
+            if self.collection:
+                doc = self.collection.find_one_and_update(
+                    {'token': token, 'status': 'pending'},
+                    {'$set': {'status': 'processing'}},
+                    sort=[('timestamp', 1)],
+                    return_document=pymongo.ReturnDocument.AFTER
+                )
+                if doc:
+                    return doc['user_id'], doc['tag'], doc['guild_id'], doc['attempt'], doc['first_try']
+                return None
+            else:
+                if hasattr(self, '_memory_queue') and token in self._memory_queue and self._memory_queue[token]:
+                    return self._memory_queue[token].pop(0)
+                return None
 
-    def size(self, token):
+    def mark_done(self, token, user_id):
+        if self.collection:
+            self.collection.delete_one({'token': token, 'user_id': user_id})
         with self.lock:
-            return len(self.queue.get(token, []))
+            if token in self.sent_cache and user_id in self.sent_cache[token]:
+                self.sent_cache[token].remove(user_id)
+
+    def mark_failed(self, token, user_id, attempt, max_attempts):
+        if self.collection:
+            if attempt < max_attempts:
+                self.collection.update_one(
+                    {'token': token, 'user_id': user_id},
+                    {'$set': {'attempt': attempt, 'status': 'pending'}}
+                )
+            else:
+                self.collection.delete_one({'token': token, 'user_id': user_id})
+        # In-memory fallback – we re-enqueue in worker
 
     def total_size(self):
-        with self.lock:
-            return sum(len(q) for q in self.queue.values())
+        if self.collection:
+            return self.collection.count_documents({'status': 'pending'})
+        else:
+            if hasattr(self, '_memory_queue'):
+                return sum(len(q) for q in self._memory_queue.values())
+            return 0
 
+    def size(self, token):
+        if self.collection:
+            return self.collection.count_documents({'token': token, 'status': 'pending'})
+        else:
+            if hasattr(self, '_memory_queue'):
+                return len(self._memory_queue.get(token, []))
+            return 0
+
+# ---------- Friend Request Sender ----------
 friend_queue = FriendRequestQueue()
 
 def friend_request_worker(token):
-    """Background worker for a single token."""
     limiter = get_friend_limiter(token)
     logging.info(f"Friend worker started for token {token[:8]}...")
     while True:
         try:
-            # Get next request from queue
             item = friend_queue.pop(token)
             if not item:
                 time.sleep(5)
                 continue
             user_id, tag, guild_id, attempt, first_try = item
 
-            # Check if retry window expired
             if time.time() - first_try > FRIEND_REQUEST_RETRY_WINDOW:
                 logging.warning(f"[Guild {guild_id}] Dropping request for {user_id} – retry window expired.")
+                friend_queue.mark_done(token, user_id)
                 continue
 
-            # Wait for rate limit capacity
             limiter.wait_until_capacity()
 
-            # Send request (dry run?)
             if DRY_RUN:
                 logging.info(f"[DRY RUN] Would send FR to {tag} ({user_id})")
                 limiter.record_send()
+                friend_queue.mark_done(token, user_id)
                 time.sleep(random.uniform(30, 120))
                 continue
 
@@ -459,21 +525,20 @@ def friend_request_worker(token):
             if success:
                 limiter.record_send()
                 logging.info(f"✅ Friend request sent to {tag} ({user_id}) in guild {guild_id}")
-                # Random delay between 30 and 120 seconds
+                friend_queue.mark_done(token, user_id)
                 time.sleep(random.uniform(30, 120))
             else:
                 logging.warning(f"❌ Failed to send friend request to {tag} ({user_id})")
-                # Re‑queue with incremented attempt
                 if attempt < FRIEND_REQUEST_RETRY_MAX:
                     friend_queue.enqueue(token, user_id, tag, guild_id, attempt + 1)
                 else:
                     logging.error(f"Gave up on {tag} ({user_id}) after {FRIEND_REQUEST_RETRY_MAX} attempts.")
+                    friend_queue.mark_done(token, user_id)
         except Exception as e:
             logging.error(f"Friend worker error: {e}")
             time.sleep(10)
 
 def send_friend_request(user_id, friend_token, guild_id, max_retries=2):
-    """Send a single friend request, returns True on success."""
     attempt = 0
     while attempt <= max_retries:
         try:
@@ -512,7 +577,7 @@ def enqueue_friend_requests_for_guild(guild_id, pending_members):
         friend_queue.enqueue(friend_token, item['member_id'], item['tag'], guild_id)
     logging.info(f"[Guild {guild_id}] Enqueued {len(pending_members)} friend requests.")
 
-# ---------- REST member fetch (fixed) ----------
+# ---------- REST member fetch ----------
 def fetch_all_members_rest(guild_id, max_retries=3):
     members = {}
     after = '0'
@@ -578,7 +643,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members if success else None
 
-# ---------- WebSocket fallback with dynamic timeout ----------
+# ---------- WebSocket fallback ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, timeout=30):
         self.token = token
@@ -706,7 +771,6 @@ class DiscordSocket(websocket.WebSocketApp):
                     logging.warning(f"[Guild {self.guild_id}] Member count is 0. Closing socket.")
                     self.close()
                     return
-                # Dynamic timeout: adjust based on member count
                 self.timeout = max(30, self.member_count / 50)
                 self.ranges = [[0, 99]]
                 self.lastRange = 0
@@ -816,7 +880,6 @@ def fetch_all_members_via_websocket(guild_id, channel_id):
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            # Get approximate member count first to set timeout
             timeout = 30
             try:
                 limiter = get_rest_limiter(guild_id)
@@ -856,7 +919,7 @@ def fetch_all_members(guild_id, channel_id):
     logging.info(f"[Guild {guild_id}] Falling back to WebSocket scraping (user token).")
     return fetch_all_members_via_websocket(guild_id, channel_id)
 
-# ---------- Webhook sending (unchanged) ----------
+# ---------- Webhook sending ----------
 def send_single_webhook(guild_id, member_id, tag, join_time, max_retries=3):
     if DRY_RUN:
         logging.info(f"[DRY RUN] Would send webhook for {member_id}")
@@ -1041,7 +1104,6 @@ def process_new_members(guild_id, new_members_dict):
         logging.info(f"[Guild {guild_id}] No new members within 2‑day window.")
         return
 
-    # Send webhooks
     if len(pending) <= INDIVIDUAL_THRESHOLD:
         logging.info(f"[Guild {guild_id}] 📨 Sending {len(pending)} members individually.")
         for item in pending:
@@ -1054,9 +1116,7 @@ def process_new_members(guild_id, new_members_dict):
             send_batch_webhook(guild_id, batch)
             time.sleep(random.uniform(1.0, 3.0))
 
-    # Enqueue friend requests (background sender will handle them)
     enqueue_friend_requests_for_guild(guild_id, pending)
-
     save_notified_cache()
     logging.info(f"[Guild {guild_id}] ✅ Finished processing new members.")
 
@@ -1108,7 +1168,7 @@ def run_health_server():
         logging.warning(f"Health server error: {e}")
 
 # ---------- Scan a single guild ----------
-previous_members = {}  # defined in main scope
+previous_members = {}
 
 def scan_guild(guild_id, channel_id):
     global previous_members
@@ -1122,7 +1182,6 @@ def scan_guild(guild_id, channel_id):
         logging.error(f"[Guild {guild_id}] Failed to fetch members.")
         return
     record_guild_success(guild_id)
-    # Process differences
     prev = previous_members.get(guild_id, {})
     prev_ids = set(prev.keys())
     curr_ids = set(current_members.keys())
@@ -1135,7 +1194,7 @@ def scan_guild(guild_id, channel_id):
         logging.info(f"[Guild {guild_id}] No new members detected.")
     previous_members[guild_id] = current_members
 
-# ---------- Webhook readiness check ----------
+# ---------- Webhook readiness ----------
 def wait_for_webhook_ready():
     logging.info("Checking webhook availability...")
     attempt = 0
@@ -1168,14 +1227,12 @@ def wait_for_webhook_ready():
 
 # ---------- Main ----------
 if __name__ == '__main__':
-    # Load config first (this also calls validate_configuration)
     load_config()
 
     logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("HTTP health check server started on port %s", os.environ.get('PORT', 10000))
 
-    # Start friend request workers for each unique token
     for token in set(friend_tokens.values()):
         threading.Thread(target=friend_request_worker, args=(token,), daemon=True).start()
     logging.info("Friend request background workers started.")
@@ -1190,7 +1247,6 @@ if __name__ == '__main__':
 
     previous_members = {}
 
-    # Initial baseline – scan all guilds sequentially (to avoid overwhelming)
     for guild_id, channel_id in guild_channel_pairs:
         logging.info(f"Building initial baseline for guild {guild_id}...")
         scan_guild(guild_id, channel_id)
@@ -1198,7 +1254,6 @@ if __name__ == '__main__':
             logging.info(f"Waiting {scan_interval}s before next guild initial scan...")
             time.sleep(scan_interval + random.uniform(0, 10))
 
-    # Main loop – scan in parallel
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_SCANS) as executor:
         while True:
             futures = []
@@ -1207,7 +1262,6 @@ if __name__ == '__main__':
                     futures.append(executor.submit(scan_guild, guild_id, channel_id))
                 else:
                     logging.info(f"[Guild {guild_id}] Skipped this cycle (failure cooldown).")
-            # Wait for all scans to complete
             for future in as_completed(futures):
                 try:
                     future.result()
@@ -1215,4 +1269,4 @@ if __name__ == '__main__':
                     logging.error(f"Scan thread error: {e}")
             log_stats()
             logging.info("Completed a full cycle. Waiting before next cycle...")
-            time.sleep(scan_interval + random.uniform(0, 300))  # add jitter up to 5 min
+            time.sleep(scan_interval + random.uniform(0, 300))
