@@ -1225,8 +1225,7 @@ if __name__ == '__main__':
     load_config()
 
     # Initialise friend queue with the configured MONGODB_URI
-    global friend_queue
-    friend_queue = FriendRequestQueue(MONGODB_URI)
+    friend_queue = FriendRequestQueue(MONGODB_URI)   # <-- removed 'global'
 
     logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
     threading.Thread(target=run_health_server, daemon=True).start()
