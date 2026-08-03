@@ -173,8 +173,6 @@ def load_config():
     # Validate guilds and tokens on startup
     validate_configuration()
 
-load_config()
-
 # ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
@@ -215,16 +213,15 @@ def save_notified_cache():
     with open(NOTIFIED_CACHE_BACKUP, 'wb') as f:
         pickle.dump(notified_members, f)
 
-# ---------- Global previous_members (used across scans) ----------
+# ---------- Global previous_members ----------
 previous_members = {}
 
 # ---------- Configuration Validation ----------
 def validate_configuration():
     """Check that all guilds exist and friend tokens are valid."""
-    global guild_channel_pairs  # MUST be at the top of the function
+    global guild_channel_pairs
     logging.info("Validating configuration...")
     valid_guilds = []
-    # Validate guilds
     for guild_id, channel_id in guild_channel_pairs:
         try:
             limiter = get_rest_limiter(guild_id)
@@ -241,10 +238,8 @@ def validate_configuration():
                 logging.warning(f"❌ Guild {guild_id} validation failed ({resp.status_code}). Skipping.")
         except Exception as e:
             logging.warning(f"❌ Guild {guild_id} validation error: {e}. Skipping.")
-    # Update guild_channel_pairs with only valid ones
     guild_channel_pairs = valid_guilds
 
-    # Validate friend tokens
     for guild_id, token in list(friend_tokens.items()):
         try:
             sess = tls_client.Session(client_identifier='chrome_105')
@@ -285,7 +280,7 @@ class RateLimiter:
                 self.calls = 0
             self.calls += 1
 
-# ---------- Friend Request Rate Limiter (sliding window with random window) ----------
+# ---------- Friend Request Rate Limiter ----------
 class FriendRequestLimiter:
     def __init__(self, max_requests, window_min, window_max):
         self.max_requests = max_requests
@@ -359,7 +354,7 @@ def is_valid_proxy_host(hostname):
     domain_re = r'^(?=.{1,253}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$'
     return bool(re.match(domain_re, hostname))
 
-# ---------- Thread‑local Session (scraper) ----------
+# ---------- Thread‑local Session ----------
 _thread_local = threading.local()
 
 def get_session():
@@ -398,16 +393,15 @@ def get_session():
                 logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return _thread_local.session
 
-# ---------- Friend Request Sender (with retry queue) ----------
+# ---------- Friend Request Sender ----------
 class FriendRequestQueue:
     def __init__(self):
-        self.queue = defaultdict(list)  # token -> list of (user_id, tag, guild_id, attempt, first_try)
+        self.queue = defaultdict(list)
         self.lock = Lock()
-        self.sent_cache = defaultdict(set)  # token -> set of user_id
+        self.sent_cache = defaultdict(set)
 
     def enqueue(self, token, user_id, tag, guild_id, attempt=0):
         with self.lock:
-            # Allow retries (attempt > 0) even if user_id is in cache.
             if attempt == 0 and user_id in self.sent_cache[token]:
                 return
             self.queue[token].append((user_id, tag, guild_id, attempt, time.time()))
@@ -431,7 +425,6 @@ class FriendRequestQueue:
 friend_queue = FriendRequestQueue()
 
 def friend_request_worker(token):
-    """Background worker for a single token."""
     limiter = get_friend_limiter(token)
     logging.info(f"Friend worker started for token {token[:8]}...")
     while True:
@@ -470,7 +463,6 @@ def friend_request_worker(token):
             time.sleep(10)
 
 def send_friend_request(user_id, friend_token, guild_id, max_retries=2):
-    """Send a single friend request, returns True on success."""
     attempt = 0
     while attempt <= max_retries:
         try:
@@ -480,7 +472,6 @@ def send_friend_request(user_id, friend_token, guild_id, max_retries=2):
                 'Content-Type': 'application/json',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36'
             })
-            # Use the same proxy as the main session if configured
             if proxy:
                 proxy_url = proxy
                 if '://' not in proxy_url:
@@ -579,7 +570,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members if success else None
 
-# ---------- WebSocket fallback with dynamic timeout ----------
+# ---------- WebSocket fallback ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, timeout=30):
         self.token = token
@@ -614,10 +605,9 @@ class DiscordSocket(websocket.WebSocketApp):
         self.heartbeat_interval = None
         self.heartbeat_thread = None
         self.member_count = 0
-        self.timeout_timer = None   # for dynamic timeout
+        self.timeout_timer = None
 
     def run(self):
-        # Start a timer that will close the socket if timeout elapses
         self.start_timeout_timer()
         self.run_forever()
         if self.timeout_timer:
@@ -715,11 +705,10 @@ class DiscordSocket(websocket.WebSocketApp):
                     logging.warning(f"[Guild {self.guild_id}] Member count is 0. Closing socket.")
                     self.close()
                     return
-                # Dynamic timeout: adjust based on member count and restart timer
                 new_timeout = max(30, self.member_count / 50)
                 if new_timeout != self.timeout:
                     self.timeout = new_timeout
-                    self.start_timeout_timer()   # restart timer with new timeout
+                    self.start_timeout_timer()
                 self.ranges = [[0, 99]]
                 self.lastRange = 0
                 self.scrapeUsers()
@@ -758,7 +747,6 @@ class DiscordSocket(websocket.WebSocketApp):
             logging.error(f"[Guild {self.guild_id}] WS error: {e}")
 
     def _add_member(self, member):
-        """Helper to parse and add a member to self.members if not blacklisted."""
         user = member.get("user", {})
         if not user:
             return
@@ -1113,7 +1101,6 @@ def scan_guild(guild_id, channel_id):
         logging.error(f"[Guild {guild_id}] Failed to fetch members.")
         return
     record_guild_success(guild_id)
-    # Use global previous_members
     prev = previous_members.get(guild_id, {})
     prev_ids = set(prev.keys())
     curr_ids = set(current_members.keys())
@@ -1126,13 +1113,15 @@ def scan_guild(guild_id, channel_id):
         logging.info(f"[Guild {guild_id}] No new members detected.")
     previous_members[guild_id] = current_members
 
+# ---------- Load configuration (now after all definitions) ----------
+load_config()
+
 # ---------- Main ----------
 if __name__ == '__main__':
     logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("HTTP health check server started on port %s", os.environ.get('PORT', 10000))
 
-    # Start friend request workers for each unique token
     for token in set(friend_tokens.values()):
         threading.Thread(target=friend_request_worker, args=(token,), daemon=True).start()
     logging.info("Friend request background workers started.")
@@ -1143,9 +1132,7 @@ if __name__ == '__main__':
         ft = friend_tokens.get(g, "None")
         logging.info(f"  Guild {g} → channel {c} | friend token: {'set' if ft != 'None' else 'not set'}")
 
-    # No undefined function call here
-
-    # Initial baseline – scan all guilds sequentially
+    # Build initial baseline
     for guild_id, channel_id in guild_channel_pairs:
         logging.info(f"Building initial baseline for guild {guild_id}...")
         scan_guild(guild_id, channel_id)
