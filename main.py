@@ -172,8 +172,10 @@ def load_config():
     if not guild_channel_pairs:
         raise ValueError("No guild-channel pairs configured.")
 
-    # Validate guilds and tokens on startup (function defined later)
+    # Validate guilds and tokens on startup
     validate_configuration()
+
+load_config()
 
 # ---------- Logging ----------
 logging.basicConfig(
@@ -220,7 +222,6 @@ def save_notified_cache():
 # ---------- Configuration Validation ----------
 def validate_configuration():
     """Check that all guilds exist and friend tokens are valid."""
-    global guild_channel_pairs, friend_tokens  # <-- FIXED: moved to top
     logging.info("Validating configuration...")
     valid_guilds = []
     # Validate guilds
@@ -241,6 +242,7 @@ def validate_configuration():
         except Exception as e:
             logging.warning(f"❌ Guild {guild_id} validation error: {e}. Skipping.")
     # Update guild_channel_pairs with only valid ones
+    global guild_channel_pairs
     guild_channel_pairs = valid_guilds
 
     # Validate friend tokens
@@ -1108,10 +1110,7 @@ def run_health_server():
         logging.warning(f"Health server error: {e}")
 
 # ---------- Scan a single guild ----------
-previous_members = {}  # defined in main scope
-
 def scan_guild(guild_id, channel_id):
-    global previous_members
     if should_skip_guild(guild_id):
         logging.info(f"[Guild {guild_id}] Skipped due to previous failures.")
         return
@@ -1135,42 +1134,8 @@ def scan_guild(guild_id, channel_id):
         logging.info(f"[Guild {guild_id}] No new members detected.")
     previous_members[guild_id] = current_members
 
-# ---------- Webhook readiness check ----------
-def wait_for_webhook_ready():
-    logging.info("Checking webhook availability...")
-    attempt = 0
-    wait_time = 2
-    while True:
-        try:
-            payload = {"content": "Startup check"}
-            response = requests.post(webhook, json=payload, timeout=10)
-            if response.status_code == 204:
-                logging.info("✅ Webhook is ready.")
-                return True
-            elif response.status_code == 429:
-                try:
-                    data = response.json()
-                    retry_after = data.get('retry_after', wait_time)
-                except:
-                    retry_after = wait_time
-                wait_time = max(wait_time, retry_after)
-                logging.warning(f"Webhook rate-limited on startup, waiting {wait_time}s...")
-                time.sleep(wait_time + random.uniform(0, 0.5))
-                attempt += 1
-                wait_time = wait_time * 2
-                continue
-            else:
-                logging.warning(f"Webhook check returned {response.status_code}. Proceeding anyway.")
-                return True
-        except Exception as e:
-            logging.warning(f"Webhook check exception: {e}. Proceeding anyway.")
-            return True
-
 # ---------- Main ----------
 if __name__ == '__main__':
-    # Load config first (this also calls validate_configuration)
-    load_config()
-
     logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("HTTP health check server started on port %s", os.environ.get('PORT', 10000))
