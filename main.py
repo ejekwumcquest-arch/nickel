@@ -13,7 +13,7 @@ import websocket
 from threading import Semaphore
 from urllib.parse import urlparse
 
-# ---------- RateLimiter class (MUST be defined before any usage) ----------
+# ---------- RateLimiter class ----------
 class RateLimiter:
     def __init__(self, max_calls, period):
         self.max_calls = max_calls
@@ -35,7 +35,7 @@ class RateLimiter:
                 self.calls = 0
             self.calls += 1
 
-# ---------- Read configuration (multi-format) ----------
+# ---------- Load configuration (multi-format, multi-channel) ----------
 def load_config():
     global token, webhook, proxy, blacklistedRoles, blacklistedUsers, scan_interval, BATCH_SIZE, INDIVIDUAL_THRESHOLD
     global guild_channel_pairs
@@ -48,7 +48,7 @@ def load_config():
     scan_interval = 1800
     BATCH_SIZE = 20
     INDIVIDUAL_THRESHOLD = 5
-    guild_channel_pairs = []
+    guild_channel_pairs = {}   # guild_id -> list of channel_ids
 
     # Try environment variables first
     if 'DISCORD_TOKEN' in os.environ:
@@ -60,8 +60,6 @@ def load_config():
         scan_interval = int(os.environ.get('SCAN_INTERVAL', '1800'))
         BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
         INDIVIDUAL_THRESHOLD = int(os.environ.get('INDIVIDUAL_THRESHOLD', '5'))
-
-        pairs_dict = {}
 
         # Format 1: DISCORD_GUILDS = "guild1:ch1,ch2;guild2:ch3"
         if 'DISCORD_GUILDS' in os.environ:
@@ -75,10 +73,7 @@ def load_config():
                 channels = [c.strip() for c in channels_part.split(',') if c.strip()]
                 if not guild or not channels:
                     continue
-                if guild not in pairs_dict:
-                    pairs_dict[guild] = channels[0]  # use first channel
-                else:
-                    logging.warning(f"Duplicate guild ID {guild} – using first channel only.")
+                guild_channel_pairs.setdefault(guild, []).extend(channels)
 
         # Format 2: DISCORD_GUILD_CONFIG = JSON array
         elif 'DISCORD_GUILD_CONFIG' in os.environ:
@@ -88,12 +83,9 @@ def load_config():
                 channels = entry.get('channels') or entry.get('channelIds') or []
                 if not g or not channels:
                     continue
-                if g not in pairs_dict:
-                    pairs_dict[g] = channels[0]
-                else:
-                    logging.warning(f"Duplicate guild ID {g} – using first channel only.")
+                guild_channel_pairs.setdefault(g, []).extend(channels)
 
-        # Format 3: parallel lists
+        # Format 3: parallel lists (one channel per guild)
         elif 'DISCORD_GUILD_IDS' in os.environ and 'DISCORD_CHANNEL_IDS' in os.environ:
             raw_guilds = os.environ.get('DISCORD_GUILD_IDS', '')
             raw_channels = os.environ.get('DISCORD_CHANNEL_IDS', '')
@@ -102,14 +94,9 @@ def load_config():
             if len(guilds) != len(channels):
                 raise ValueError("Number of guild IDs and channel IDs must match.")
             for g, c in zip(guilds, channels):
-                if g not in pairs_dict:
-                    pairs_dict[g] = c
-                else:
-                    logging.warning(f"Duplicate guild ID {g} – using first channel only.")
+                guild_channel_pairs.setdefault(g, []).append(c)
 
-        if pairs_dict:
-            guild_channel_pairs = list(pairs_dict.items())
-        else:
+        if not guild_channel_pairs:
             raise ValueError("No guild configuration found. Provide DISCORD_GUILDS, DISCORD_GUILD_CONFIG, or DISCORD_GUILD_IDS+CHANNEL_IDS.")
 
     else:
@@ -127,23 +114,22 @@ def load_config():
             INDIVIDUAL_THRESHOLD = config.get('individual_threshold', 5)
 
             if 'guilds' in config and isinstance(config['guilds'], list):
-                pairs_dict = {}
                 for item in config['guilds']:
                     g = item.get('guildId') or item.get('guild')
                     channels = item.get('channels') or item.get('channelIds') or []
                     if not g or not channels:
                         continue
-                    if g not in pairs_dict:
-                        pairs_dict[g] = channels[0]
-                guild_channel_pairs = list(pairs_dict.items())
+                    guild_channel_pairs.setdefault(g, []).extend(channels)
             else:
                 # old single-guild style
                 g = config.get('guildID') or config.get('guildId')
                 c = config.get('channelId') or config.get('channelIDs')
-                if isinstance(g, list): g = g[0]
-                if isinstance(c, list): c = c[0]
+                if isinstance(g, list):
+                    g = g[0]
+                if isinstance(c, list):
+                    c = c[0]
                 if g and c:
-                    guild_channel_pairs = [(g, c)]
+                    guild_channel_pairs[g] = [c] if not isinstance(c, list) else c
         except FileNotFoundError:
             raise ValueError("No configuration found. Set environment variables or provide config.json.")
 
@@ -240,7 +226,7 @@ def get_session():
                 logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return shared_session
 
-# ---------- REST member fetch ----------
+# ---------- REST member fetch (fixed: returns None on failure) ----------
 def fetch_all_members_rest(guild_id, max_retries=3):
     members = {}
     after = '0'
@@ -255,7 +241,10 @@ def fetch_all_members_rest(guild_id, max_retries=3):
                 params={'limit': 1000, 'after': after}
             )
             if resp.status_code == 429:
-                retry_after = resp.json().get('retry_after', 2)
+                try:
+                    retry_after = resp.json().get('retry_after', 2)
+                except:
+                    retry_after = 2
                 logging.warning(f"[Guild {guild_id}] REST rate limited, waiting {retry_after}s...")
                 time.sleep(retry_after + random.uniform(0, 0.5))
                 continue
@@ -269,10 +258,11 @@ def fetch_all_members_rest(guild_id, max_retries=3):
                 logging.error(f"[Guild {guild_id}] REST fetch failed: {resp.status_code} - {resp.text[:200]}")
                 retry_count += 1
                 if retry_count > max_retries:
-                    break
+                    return None
                 sleep_time = (2 ** retry_count) + random.uniform(0, 1)
                 time.sleep(sleep_time)
                 continue
+            # Success: parse JSON
             data = resp.json()
             if not data:
                 break
@@ -300,11 +290,11 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             logging.error(f"[Guild {guild_id}] REST fetch error: {e}")
             retry_count += 1
             if retry_count > max_retries:
-                break
+                return None
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
-    return members
+    return members   # might be empty, but that's a successful fetch (no members)
 
-# ---------- WebSocket fallback ----------
+# ---------- WebSocket fallback (unchanged except logging) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -558,16 +548,30 @@ def fetch_all_members_via_websocket(guild_id, channel_id):
             time.sleep((2 ** attempt) + random.uniform(0, 1))
     return all_members
 
-# ---------- Unified member fetcher ----------
-def fetch_all_members(guild_id, channel_id):
+# ---------- Unified member fetcher (supports multiple channels) ----------
+def fetch_all_members(guild_id, channels):
+    """
+    Tries REST first. If that fails (returns None), tries WebSocket on each channel until one works.
+    Returns a dict of members (user_id -> (tag, joined_at)), or empty dict if all fail.
+    """
     rest_members = fetch_all_members_rest(guild_id)
     if rest_members is not None:
         logging.info(f"[Guild {guild_id}] REST fetch successful.")
         return rest_members
-    logging.info(f"[Guild {guild_id}] Falling back to WebSocket scraping (user token).")
-    return fetch_all_members_via_websocket(guild_id, channel_id)
 
-# ---------- Webhook sending ----------
+    logging.info(f"[Guild {guild_id}] REST failed. Trying WebSocket fallback on channels: {channels}")
+    for ch in channels:
+        logging.info(f"[Guild {guild_id}] Attempting WS on channel {ch}")
+        ws_members = fetch_all_members_via_websocket(guild_id, ch)
+        if ws_members:
+            logging.info(f"[Guild {guild_id}] WS on channel {ch} returned {len(ws_members)} members.")
+            return ws_members
+        else:
+            logging.warning(f"[Guild {guild_id}] WS on channel {ch} returned no members.")
+    logging.error(f"[Guild {guild_id}] All fetch methods failed.")
+    return {}
+
+# ---------- Webhook sending (unchanged) ----------
 def send_single_webhook(guild_id, member_id, tag, join_time, max_retries=3):
     attempt = 0
     wait_time = 2
@@ -686,7 +690,7 @@ def send_batch_webhook(guild_id, batch, max_retries=3):
             attempt += 1
             time.sleep((2 ** attempt) + random.uniform(0, 1))
 
-# ---------- Processing ----------
+# ---------- Processing (unchanged) ----------
 def process_new_members(guild_id, new_members_dict):
     if not new_members_dict:
         return
@@ -756,7 +760,7 @@ def fetch_member_joined_at(guild_id, user_id):
         logging.error(f"[Guild {guild_id}] Error fetching member {user_id}: {e}")
         return None
 
-# ---------- Startup webhook check ----------
+# ---------- Startup webhook check (unchanged) ----------
 def wait_for_webhook_ready():
     logging.info("Checking webhook availability...")
     attempt = 0
@@ -787,7 +791,7 @@ def wait_for_webhook_ready():
             logging.warning(f"Webhook check exception: {e}. Proceeding anyway.")
             return True
 
-# ---------- Health Check Server ----------
+# ---------- Health Check Server (unchanged) ----------
 def run_health_server():
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -813,17 +817,17 @@ if __name__ == '__main__':
 
     webhook_mask = webhook[:40] + "..." if len(webhook) > 40 else webhook
     logging.info("Configuration: %d guild(s), webhook: %s", len(guild_channel_pairs), webhook_mask)
-    for g, c in guild_channel_pairs:
-        logging.info(f"  Guild {g} → channel {c}")
+    for g, channels in guild_channel_pairs.items():
+        logging.info(f"  Guild {g} → channels: {', '.join(channels)}")
 
     wait_for_webhook_ready()
 
     previous_members = {}  # guild_id -> {user_id: (tag, joined_at)}
 
     # Initial baseline: scan all guilds once
-    for guild_id, channel_id in guild_channel_pairs:
+    for guild_id, channels in guild_channel_pairs.items():
         logging.info(f"Building initial baseline for guild {guild_id}...")
-        members = fetch_all_members(guild_id, channel_id)
+        members = fetch_all_members(guild_id, channels)
         if members:
             previous_members[guild_id] = members
             logging.info(f"Baseline for guild {guild_id}: {len(members)} members.")
@@ -832,16 +836,16 @@ if __name__ == '__main__':
             logging.warning(f"Failed to fetch initial members for guild {guild_id}. Skipping.")
             previous_members[guild_id] = {}
         # Wait between initial scans too
-        if guild_id != guild_channel_pairs[-1][0]:
+        if guild_id != list(guild_channel_pairs.keys())[-1]:
             logging.info(f"Waiting {scan_interval}s before next guild initial scan...")
             time.sleep(scan_interval + random.uniform(0, 10))
 
     # Main rotation loop
     while True:
-        for guild_id, channel_id in guild_channel_pairs:
-            logging.info(f"Scanning guild {guild_id} (channel {channel_id})...")
-            current_members = fetch_all_members(guild_id, channel_id)
-            if current_members is None:
+        for guild_id, channels in guild_channel_pairs.items():
+            logging.info(f"Scanning guild {guild_id} (channels: {', '.join(channels)})...")
+            current_members = fetch_all_members(guild_id, channels)
+            if not current_members:   # empty dict means failure
                 logging.error(f"Failed to fetch members for guild {guild_id}. Skipping this cycle.")
                 time.sleep(scan_interval + random.uniform(0, 10))
                 continue
@@ -859,7 +863,7 @@ if __name__ == '__main__':
 
             previous_members[guild_id] = current_members
 
-            if guild_id != guild_channel_pairs[-1][0]:
+            if guild_id != list(guild_channel_pairs.keys())[-1]:
                 logging.info(f"Waiting {scan_interval}s before moving to next guild...")
                 time.sleep(scan_interval + random.uniform(0, 10))
 
