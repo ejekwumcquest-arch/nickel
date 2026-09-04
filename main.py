@@ -760,11 +760,9 @@ def fetch_member_joined_at(guild_id, user_id):
         logging.error(f"[Guild {guild_id}] Error fetching member {user_id}: {e}")
         return None
 
-# ---------- Startup webhook check (unchanged) ----------
+# ---------- Startup webhook check (FIXED: honour retry_after, no doubling) ----------
 def wait_for_webhook_ready():
     logging.info("Checking webhook availability...")
-    attempt = 0
-    wait_time = 2
     while True:
         try:
             payload = {"content": "Startup check"}
@@ -774,15 +772,13 @@ def wait_for_webhook_ready():
                 return True
             elif response.status_code == 429:
                 try:
-                    data = response.json()
-                    retry_after = data.get('retry_after', wait_time)
+                    retry_after = response.json().get('retry_after', 2)
                 except:
-                    retry_after = wait_time
-                wait_time = max(wait_time, retry_after)
-                logging.warning(f"Webhook rate-limited on startup, waiting {wait_time}s...")
-                time.sleep(wait_time + random.uniform(0, 0.5))
-                attempt += 1
-                wait_time = wait_time * 2
+                    retry_after = 2
+                # Wait exactly the returned value (plus a tiny jitter)
+                logging.warning(f"Webhook rate-limited on startup, waiting {retry_after}s...")
+                time.sleep(retry_after + random.uniform(0, 0.5))
+                # Continue loop – will retry after the exact wait
                 continue
             else:
                 logging.warning(f"Webhook check returned {response.status_code}. Proceeding anyway.")
@@ -820,6 +816,7 @@ if __name__ == '__main__':
     for g, channels in guild_channel_pairs.items():
         logging.info(f"  Guild {g} → channels: {', '.join(channels)}")
 
+    # Now the startup check will wait exactly the retry_after time if rate‑limited
     wait_for_webhook_ready()
 
     previous_members = {}  # guild_id -> {user_id: (tag, joined_at)}
