@@ -760,13 +760,17 @@ def fetch_member_joined_at(guild_id, user_id):
         logging.error(f"[Guild {guild_id}] Error fetching member {user_id}: {e}")
         return None
 
-# ---------- Startup webhook check (FIXED: honour retry_after, no doubling) ----------
+# ---------- Startup webhook check (FIXED: uses HEAD, max retries) ----------
 def wait_for_webhook_ready():
     logging.info("Checking webhook availability...")
-    while True:
+    # Wait a moment to let any lingering rate limit expire
+    time.sleep(1)
+    max_attempts = 5
+    attempt = 0
+    while attempt < max_attempts:
         try:
-            payload = {"content": "Startup check"}
-            response = requests.post(webhook, json=payload, timeout=10)
+            # Use HEAD to avoid consuming rate limit (Discord returns 204 for valid webhooks)
+            response = requests.head(webhook, timeout=10)
             if response.status_code == 204:
                 logging.info("✅ Webhook is ready.")
                 return True
@@ -775,17 +779,20 @@ def wait_for_webhook_ready():
                     retry_after = response.json().get('retry_after', 2)
                 except:
                     retry_after = 2
-                # Wait exactly the returned value (plus a tiny jitter)
-                logging.warning(f"Webhook rate-limited on startup, waiting {retry_after}s...")
+                logging.warning(f"Webhook rate-limited on startup, waiting {retry_after}s... (attempt {attempt+1}/{max_attempts})")
                 time.sleep(retry_after + random.uniform(0, 0.5))
-                # Continue loop – will retry after the exact wait
+                attempt += 1
                 continue
             else:
-                logging.warning(f"Webhook check returned {response.status_code}. Proceeding anyway.")
+                # Any other status – log but proceed (webhook might still work)
+                logging.warning(f"Webhook HEAD returned {response.status_code}. Proceeding anyway.")
                 return True
         except Exception as e:
             logging.warning(f"Webhook check exception: {e}. Proceeding anyway.")
             return True
+    # If we exhausted attempts, proceed with a warning
+    logging.warning("Webhook startup check gave up after max attempts. Proceeding anyway.")
+    return True
 
 # ---------- Health Check Server (unchanged) ----------
 def run_health_server():
@@ -816,7 +823,6 @@ if __name__ == '__main__':
     for g, channels in guild_channel_pairs.items():
         logging.info(f"  Guild {g} → channels: {', '.join(channels)}")
 
-    # Now the startup check will wait exactly the retry_after time if rate‑limited
     wait_for_webhook_ready()
 
     previous_members = {}  # guild_id -> {user_id: (tag, joined_at)}
