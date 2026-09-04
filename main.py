@@ -226,11 +226,13 @@ def get_session():
                 logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return shared_session
 
-# ---------- REST member fetch (fixed: returns None on failure) ----------
+# ---------- REST member fetch (with max 429 retries) ----------
 def fetch_all_members_rest(guild_id, max_retries=3):
     members = {}
     after = '0'
     retry_count = 0
+    rate_limit_retries = 0
+    max_rate_limit_retries = 5  # Give up after 5 consecutive 429s
     limiter = get_rest_limiter(guild_id)
     while True:
         try:
@@ -241,13 +243,19 @@ def fetch_all_members_rest(guild_id, max_retries=3):
                 params={'limit': 1000, 'after': after}
             )
             if resp.status_code == 429:
+                rate_limit_retries += 1
+                if rate_limit_retries > max_rate_limit_retries:
+                    logging.error(f"[Guild {guild_id}] Too many rate limits on REST. Falling back to WebSocket.")
+                    return None
                 try:
-                    retry_after = resp.json().get('retry_after', 2)
+                    retry_after = resp.json().get('retry_after', 5)
                 except:
-                    retry_after = 2
-                logging.warning(f"[Guild {guild_id}] REST rate limited, waiting {retry_after}s...")
-                time.sleep(retry_after + random.uniform(0, 0.5))
+                    retry_after = 5
+                logging.warning(f"[Guild {guild_id}] REST rate limited, waiting {retry_after}s... (attempt {rate_limit_retries}/{max_rate_limit_retries})")
+                time.sleep(retry_after + random.uniform(0, 1))
                 continue
+            # Reset rate limit counter on success
+            rate_limit_retries = 0
             if resp.status_code == 403:
                 logging.warning(f"[Guild {guild_id}] REST endpoint returned 403 (Missing Access) – falling back to WebSocket.")
                 return None
@@ -294,7 +302,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members   # might be empty, but that's a successful fetch (no members)
 
-# ---------- WebSocket fallback (unchanged except logging) ----------
+# ---------- WebSocket fallback (unchanged) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -760,38 +768,11 @@ def fetch_member_joined_at(guild_id, user_id):
         logging.error(f"[Guild {guild_id}] Error fetching member {user_id}: {e}")
         return None
 
-# ---------- Startup webhook check (FIXED: uses HEAD, max retries) ----------
+# ---------- Startup webhook check (DISABLED) ----------
+# We are skipping the startup check entirely to avoid unnecessary rate limits.
+# The webhook is assumed to be valid.
 def wait_for_webhook_ready():
-    logging.info("Checking webhook availability...")
-    # Wait a moment to let any lingering rate limit expire
-    time.sleep(1)
-    max_attempts = 5
-    attempt = 0
-    while attempt < max_attempts:
-        try:
-            # Use HEAD to avoid consuming rate limit (Discord returns 204 for valid webhooks)
-            response = requests.head(webhook, timeout=10)
-            if response.status_code == 204:
-                logging.info("✅ Webhook is ready.")
-                return True
-            elif response.status_code == 429:
-                try:
-                    retry_after = response.json().get('retry_after', 2)
-                except:
-                    retry_after = 2
-                logging.warning(f"Webhook rate-limited on startup, waiting {retry_after}s... (attempt {attempt+1}/{max_attempts})")
-                time.sleep(retry_after + random.uniform(0, 0.5))
-                attempt += 1
-                continue
-            else:
-                # Any other status – log but proceed (webhook might still work)
-                logging.warning(f"Webhook HEAD returned {response.status_code}. Proceeding anyway.")
-                return True
-        except Exception as e:
-            logging.warning(f"Webhook check exception: {e}. Proceeding anyway.")
-            return True
-    # If we exhausted attempts, proceed with a warning
-    logging.warning("Webhook startup check gave up after max attempts. Proceeding anyway.")
+    logging.info("Skipping webhook startup check to avoid rate limits.")
     return True
 
 # ---------- Health Check Server (unchanged) ----------
@@ -823,6 +804,11 @@ if __name__ == '__main__':
     for g, channels in guild_channel_pairs.items():
         logging.info(f"  Guild {g} → channels: {', '.join(channels)}")
 
+    # Wait a moment to let any lingering rate limit expire
+    logging.info("Waiting 5 seconds before starting to avoid rate limits...")
+    time.sleep(5)
+
+    # Skip the webhook check entirely – we assume it's valid.
     wait_for_webhook_ready()
 
     previous_members = {}  # guild_id -> {user_id: (tag, joined_at)}
